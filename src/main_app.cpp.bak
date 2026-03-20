@@ -1,0 +1,597 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <RTClib.h> 
+#include <waterlevelsensor.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ============================================================
+//  Hardware Pin Configuration
+// ============================================================
+// I2C Pins (DS3231 RTC + Water Level Sensor)
+constexpr uint8_t PIN_SDA = 21;
+constexpr uint8_t PIN_SCL = 22;
+
+// SPI Pins (MicroSD Card Reader)
+constexpr uint8_t PIN_SD_CS   = 14;
+constexpr uint8_t PIN_SD_MOSI = 26;
+constexpr uint8_t PIN_SD_SCK  = 27;
+constexpr uint8_t PIN_SD_MISO = 25;
+
+// Output Pins (Relays/Mosfets)
+constexpr uint8_t PIN_CIRCULATION_PUMP = 5;
+constexpr uint8_t PIN_REFILL_PUMP      = 17;
+constexpr uint8_t PIN_ONBOARD_LED      = 2; // ESP32 DevKit built-in LED
+
+// OneWire Pin (DS18B20 Temperature)
+constexpr uint8_t PIN_TEMP_BUS = 33;
+
+// ============================================================
+//  Settings
+// ============================================================
+constexpr int WATER_LEVEL_MIN_THRESHOLD = 20;
+constexpr int WATER_LEVEL_MAX_THRESHOLD = 80;
+
+constexpr uint8_t       CIRCULATION_HOUR        = 14;
+constexpr uint8_t       CIRCULATION_MINUTE      = 30;
+constexpr unsigned long CIRCULATION_DURATION_MS  = 300000UL;
+
+constexpr unsigned long MAX_REFILL_TIME_MS = 120000UL;
+constexpr unsigned long LOG_INTERVAL_MS = 30000UL;
+constexpr const char*   LOG_FILENAME    = "/hydro.csv";
+
+constexpr unsigned long SERIAL_BAUD_RATE        = 115200;
+
+// ============================================================
+//  Temperature Manager (Non-Blocking)
+// ============================================================
+class TemperatureManager {
+public:
+    TemperatureManager() : _oneWire(PIN_TEMP_BUS), _sensors(&_oneWire) {}
+    
+    void begin() {
+        _sensors.begin();
+        _sensors.setWaitForConversion(false); // IMPORTANT: Make it async
+        Serial.println("[TEMP] DS18B20 initialized (Async)");
+        _requestTime = millis();
+        _sensors.requestTemperatures(); // Start first conversion
+    }
+
+    void update() {
+        unsigned long now = millis();
+        // Read every 2 seconds
+        if (now - _lastProcessTime < 2000) return; 
+
+        // Check if conversion is done (750ms for 12-bit, so 2000ms is plenty)
+        float t = _sensors.getTempCByIndex(0);
+        
+        if (t == DEVICE_DISCONNECTED_C || t < -80) {
+            _valid = false;
+        } else {
+            _tempC = t;
+            _valid = true;
+        }
+
+        // Start next conversion immediately after reading
+        _sensors.requestTemperatures();
+        _requestTime = now;
+        _lastProcessTime = now;
+    }
+
+    float getCelsius() const { return _tempC; }
+    bool isValid() const { return _valid; }
+
+private:
+    OneWire _oneWire;
+    DallasTemperature _sensors;
+    float _tempC = -127.0f;
+    bool _valid = false;
+    unsigned long _requestTime = 0;
+    unsigned long _lastProcessTime = 0;
+};
+
+// ============================================================
+//  WaterLevelManager
+// ============================================================
+enum class WaterLevelState : uint8_t {
+    LEVEL_EMPTY,
+    LEVEL_LOW,
+    LEVEL_NORMAL,
+    LEVEL_HIGH
+};
+
+class WaterLevelManager {
+public:
+    void begin() {
+        // Wire.begin() is called in setup()
+        if (_sensor.begin()) {
+            Serial.println("[WATER] Grove Dual-Sensor (Low+High) detected.");
+        } else {
+            Serial.println("[WATER] WARNING: One or both sensor modules MISSING!");
+        }
+    }
+
+    void update() {
+        unsigned long now = millis();
+        if (now - _lastReadTime < 1000) return;
+        _lastReadTime = now;
+
+        // The library reads from I2C. If device missing, it might return 0 or garbage.
+        int reading = _sensor.readPercentage(); 
+        
+        // Filter garbage
+        if (reading > 100) reading = 100;
+        if (reading < 0) reading = 0;
+
+        _percentage = reading;
+
+        if (_percentage == 0) {
+            _state = WaterLevelState::LEVEL_EMPTY;
+        } else if (_percentage < WATER_LEVEL_MIN_THRESHOLD) {
+            _state = WaterLevelState::LEVEL_LOW;
+        } else if (_percentage >= WATER_LEVEL_MAX_THRESHOLD) {
+            _state = WaterLevelState::LEVEL_HIGH;
+        } else {
+            _state = WaterLevelState::LEVEL_NORMAL;
+        }
+    }
+
+    int             getPercentage() const { return _percentage; }
+    WaterLevelState getState()      const { return _state; }
+
+    const char* getStateName() const {
+        switch (_state) {
+            case WaterLevelState::LEVEL_EMPTY:  return "EMPTY";
+            case WaterLevelState::LEVEL_LOW:    return "LOW";
+            case WaterLevelState::LEVEL_NORMAL: return "NORMAL";
+            case WaterLevelState::LEVEL_HIGH:   return "HIGH";
+            default:                            return "UNKNOWN";
+        }
+    }
+
+private:
+    WaterLevelSensor _sensor;
+    int              _percentage   = 0;
+    WaterLevelState  _state        = WaterLevelState::LEVEL_EMPTY;
+    unsigned long    _lastReadTime = 0;
+};
+
+// ============================================================
+//  PumpController
+// ============================================================
+class PumpController {
+public:
+    PumpController(uint8_t pin, const char* name)
+        : _pin(pin), _name(name) {}
+
+    void begin() {
+        pinMode(_pin, OUTPUT);
+        digitalWrite(_pin, HIGH);  // Active LOW relays: HIGH = OFF
+        _running = false;
+        Serial.printf("[PUMP] %s initialized on GPIO%d (OFF)\n", _name, _pin);
+    }
+
+    void turnOn() {
+        if (_running) return;
+        digitalWrite(_pin, LOW);  // Active LOW
+        _running = true;
+        Serial.printf("[PUMP] %s -> ON\n", _name);
+    }
+
+    void turnOff() {
+        if (!_running) return;
+        digitalWrite(_pin, HIGH); // Active LOW
+        _running = false;
+        Serial.printf("[PUMP] %s -> OFF\n", _name);
+    }
+
+    bool isOn() const { 
+        return digitalRead(_pin) == LOW; 
+    }
+    const char* getName() const { return _name; }
+
+private:
+    uint8_t     _pin;
+    const char* _name;
+    bool        _running = false;
+};
+
+// ============================================================
+//  RTCManager (DS3231)
+// ============================================================
+class RTCManager {
+public:
+    RTCManager() {}
+
+    void begin(bool forceSync = false) {
+        if (!_rtc.begin()) {
+            Serial.println("[RTC] FAILURE: DS3231 not detected on I2C!");
+            _valid = false;
+            return;
+        }
+
+        if (forceSync || _rtc.lostPower()) {
+            Serial.println("[RTC] Syncing time to compilation time...");
+            _rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+        }
+        
+        _valid = true;
+        
+        DateTime now = _rtc.now();
+        Serial.printf("[RTC] Time: %04d-%02d-%02d %02d:%02d:%02d\n", 
+            now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+    }
+
+    void update() {
+        if (!_valid) return;
+        unsigned long now = millis();
+        if (now - _lastUpdate < 1000) return;
+        _lastUpdate = now;
+
+        DateTime dt = _rtc.now();
+        
+        _second = dt.second();
+        _minute = dt.minute();
+        _hour   = dt.hour();
+        _day    = dt.day();
+        _month  = dt.month();
+        _year   = dt.year();
+    }
+
+    uint8_t getHour()   const { return _hour; }
+    uint8_t getMinute() const { return _minute; }
+    uint8_t getSecond() const { return _second; }
+
+    void getTimestamp(char* buf, size_t len) const {
+        snprintf(buf, len, "%04u-%02u-%02u %02u:%02u:%02u",
+                 (unsigned)_year, (unsigned)_month, (unsigned)_day,
+                 (unsigned)_hour, (unsigned)_minute, (unsigned)_second);
+    }
+
+    bool isValid() const { return _valid; }
+
+private:
+    RTC_DS3231 _rtc;
+    uint8_t  _hour = 0, _minute = 0, _second = 0, _day = 0, _month = 0;
+    uint16_t _year = 0;
+    bool     _valid  = false;
+    unsigned long _lastUpdate = 0;
+};
+
+// ============================================================
+//  SDLogger
+// ============================================================
+class SDLogger {
+public:
+    void begin() {
+        SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
+        if (!SD.begin(PIN_SD_CS)) {
+            Serial.println("[SD] Mount Failed or No Card");
+            _ready = false;
+            return;
+        }
+        _ready = true;
+        Serial.println("[SD] Mounted successfully");
+        if (!SD.exists(LOG_FILENAME)) {
+            writeLineToFile("timestamp,level_pct,level_state,refill,circulation,temp_c");
+        }
+    }
+
+    void logData(const RTCManager& rtc,
+                 const WaterLevelManager& water,
+                 const PumpController& refillPump,
+                 const PumpController& circPump,
+                 const TemperatureManager& temp) {
+        if (!_ready) return;
+        char ts[24];
+        rtc.getTimestamp(ts, sizeof(ts));
+        
+        char tempStr[8];
+        if (temp.isValid()) dtostrf(temp.getCelsius(), 4, 1, tempStr);
+        else strcpy(tempStr, "ERR");
+
+        char line[128];
+        snprintf(line, sizeof(line), "%s,LEVEL=%d,STATE=%s,REFILL=%s,CIRC=%s,TEMP=%s",
+                 ts,
+                 water.getPercentage(),
+                 water.getStateName(),
+                 refillPump.isOn() ? "ON" : "OFF",
+                 circPump.isOn()   ? "ON" : "OFF",
+                 tempStr);
+        writeLineToFile(line);
+        Serial.printf("[SD LOG] %s\n", line);
+    }
+
+    void logEvent(const RTCManager& rtc, const char* message) {
+        if (!_ready) return;
+        char ts[24];
+        rtc.getTimestamp(ts, sizeof(ts));
+        char line[160];
+        snprintf(line, sizeof(line), "%s,EVENT,%s", ts, message);
+        writeLineToFile(line);
+        Serial.printf("[SD EVENT] %s\n", line);
+    }
+
+    bool isReady() const { return _ready; }
+
+private:
+    bool _ready = false;
+
+    void writeLineToFile(const char* line) {
+        File f = SD.open(LOG_FILENAME, FILE_APPEND);
+        if (f) {
+            f.println(line);
+            f.close();
+        } else {
+             Serial.println("[SD] Write failed");
+        }
+    }
+};
+
+// ============================================================
+//  Controllers (Logic)
+// ============================================================
+class RefillController {
+public:
+    RefillController(PumpController& pump, WaterLevelManager& waterLevel)
+        : _pump(pump), _waterLevel(waterLevel) {}
+
+    void update() {
+        WaterLevelState state = _waterLevel.getState();
+
+        if (_refilling && !_pump.isOn()) _refilling = false;
+
+        if (!_refilling) {
+            if (state == WaterLevelState::LEVEL_LOW) {
+                Serial.println("[AUTOPILOT] Level LOW -> START Refill");
+                _pump.turnOn();
+                _refilling = true;
+            }
+        } else {
+            if (state == WaterLevelState::LEVEL_HIGH) {
+                Serial.println("[AUTOPILOT] Level HIGH -> STOP Refill");
+                _pump.turnOff();
+                _refilling = false;
+            }
+        }
+    }
+private:
+    PumpController&    _pump;
+    WaterLevelManager& _waterLevel;
+    bool               _refilling = false;
+};
+
+class CirculationController {
+public:
+    CirculationController(PumpController& pump, const RTCManager& rtc)
+        : _pump(pump), _rtc(rtc) {}
+
+    void begin() {
+        Serial.printf("[CIRC] Schedule: %02u:%02u Daily for %lu sec\n",
+                      CIRCULATION_HOUR, CIRCULATION_MINUTE,
+                      CIRCULATION_DURATION_MS / 1000);
+    }
+
+    void update() {
+        unsigned long now = millis();
+        if (_circulating && !_pump.isOn()) _circulating = false;
+
+        if (!_rtc.isValid()) return; // Can't schedule without time
+
+        uint8_t h = _rtc.getHour();
+        uint8_t m = _rtc.getMinute();
+
+        // Reset trigger flag once the minute has passed
+        if (_triggeredToday && m != CIRCULATION_MINUTE) {
+            _triggeredToday = false;
+        }
+
+        if (!_circulating) {
+            if (!_triggeredToday && h == CIRCULATION_HOUR && m == CIRCULATION_MINUTE) {
+                Serial.println("[CIRC] Timer matched -> START Circulation");
+                _pump.turnOn();
+                _circulating    = true;
+                _triggeredToday = true;
+                _pumpStartTime  = now;
+            }
+        } else {
+            if (now - _pumpStartTime >= CIRCULATION_DURATION_MS) {
+                Serial.println("[CIRC] Duration reached -> STOP Circulation");
+                _pump.turnOff();
+                _circulating = false;
+            }
+        }
+    }
+private:
+    PumpController&   _pump;
+    const RTCManager& _rtc;
+    bool              _circulating    = false;
+    bool              _triggeredToday = false;
+    unsigned long     _pumpStartTime  = 0;
+};
+
+class SafetyManager {
+public:
+    SafetyManager(WaterLevelManager& waterLevel,
+                  PumpController&    circulationPump,
+                  PumpController&    refillPump,
+                  SDLogger&          logger,
+                  const RTCManager&  rtc)
+        : _waterLevel(waterLevel),
+          _circulationPump(circulationPump),
+          _refillPump(refillPump),
+          _logger(logger),
+          _rtc(rtc) {}
+
+    void update() {
+        WaterLevelState state = _waterLevel.getState();
+        
+        // Overflow safety (if sensor reads > MAX while pump is OFF, maybe leak or manual fill?)
+        // Not implemented here, but we catch sensor failures.
+
+        // Refill Timeout Safety
+        if (_refillPump.isOn()) {
+            if (_refillRunStart == 0) _refillRunStart = millis();
+            
+            if (millis() - _refillRunStart > MAX_REFILL_TIME_MS) {
+                Serial.println("[SAFETY] Refill Timeout! Locking pump.");
+                _logger.logEvent(_rtc, "SAFETY:REFILL_TIMEOUT_LOCK");
+                _refillPump.turnOff();
+                _refillLocked = true;
+            }
+        } else {
+            _refillRunStart = 0;
+        }
+
+        // Stop Refill if High Level (Redundant safety)
+        if (state == WaterLevelState::LEVEL_HIGH && _refillPump.isOn()) {
+            Serial.println("[SAFETY] High Level Intercept -> Stop Refill");
+            _refillPump.turnOff();
+        }
+    }
+
+    bool isEmergency()    const { return _emergencyStop; }
+    bool isRefillLocked() const { return _refillLocked; }
+
+private:
+    WaterLevelManager& _waterLevel;
+    PumpController&    _circulationPump;
+    PumpController&    _refillPump;
+    SDLogger&          _logger;
+    const RTCManager&  _rtc;
+
+    bool          _emergencyStop   = false;
+    bool          _refillLocked    = false;
+    unsigned long _refillRunStart  = 0;
+};
+
+// ============================================================
+//  Instances & Globals
+// ============================================================
+
+WaterLevelManager   waterLevel;
+RTCManager          rtc;
+TemperatureManager  temp;
+SDLogger            sdLogger;
+
+PumpController      circulationPump(PIN_CIRCULATION_PUMP, "Circulation");
+PumpController      refillPump(PIN_REFILL_PUMP, "Refill");
+
+RefillController       refill(refillPump, waterLevel);
+CirculationController  circulation(circulationPump, rtc);
+SafetyManager          safety(waterLevel, circulationPump, refillPump, sdLogger, rtc);
+
+// Timers
+static unsigned long lastDebugPrint = 0;
+static unsigned long lastLogTime    = 0;
+
+void i2cCheckSpecific() {
+    Serial.println("\n[I2C CHECK] Verifying specific devices...");
+    
+    // Check RTC (0x68)
+    Wire.beginTransmission(0x68);
+    if (Wire.endTransmission() == 0) Serial.println("[I2C] DS3231 RTC found at 0x68");
+    else Serial.println("[I2C] DS3231 RTC NOT FOUND at 0x68");
+
+    // Check Water Level Low (0x77)
+    Wire.beginTransmission(0x77);
+    if (Wire.endTransmission() == 0) Serial.println("[I2C] Water Level (Low) found at 0x77");
+    else Serial.println("[I2C] Water Level (Low) NOT FOUND at 0x77");
+
+    // Check Water Level High (0x78)
+    Wire.beginTransmission(0x78);
+    if (Wire.endTransmission() == 0) Serial.println("[I2C] Water Level (High) found at 0x78");
+    else Serial.println("[I2C] Water Level (High) NOT FOUND at 0x78");
+    
+    Serial.println("[I2C CHECK] Done\n");
+}
+
+void setup() {
+    Serial.begin(SERIAL_BAUD_RATE);
+    delay(2000); // Wait for serial monitor
+    Serial.println("\n=== Hydroponics System Starting ===");
+
+    pinMode(PIN_ONBOARD_LED, OUTPUT);
+
+    // Initialize I2C Bus ONCE
+    Wire.begin(PIN_SDA, PIN_SCL);
+    // Wire.setClock(100000); // Optional: Slow down clock if needed
+    
+    // Check specific devices instead of scanning all
+    i2cCheckSpecific();
+
+    // Init Modules
+    waterLevel.begin();
+    
+    // Force RTC set to compile time on this upload
+    rtc.begin(true);
+    
+    temp.begin();
+    
+    circulationPump.begin();
+    refillPump.begin();
+    
+    sdLogger.begin();
+    sdLogger.logEvent(rtc, "BOOT");
+
+    circulation.begin();
+    
+    Serial.println("=== Initialization Complete ===\n");
+}
+
+void loop() {
+    // 1. Update Sensors
+    waterLevel.update();
+    rtc.update();
+    temp.update();
+    safety.update();
+
+    // 2. Run Logic
+    if (!safety.isEmergency()) {
+        if (!safety.isRefillLocked()) refill.update();
+        circulation.update();
+    }
+
+    // 3. Periodic Logging
+    if (millis() - lastLogTime >= LOG_INTERVAL_MS) {
+        lastLogTime = millis();
+        // Force blink
+        digitalWrite(PIN_ONBOARD_LED, !digitalRead(PIN_ONBOARD_LED));
+        
+        sdLogger.logData(rtc, waterLevel, refillPump, circulationPump, temp);
+    }
+
+    // 4. Debug Print (Every 3 seconds)
+    if (millis() - lastDebugPrint >= 3000) {
+        lastDebugPrint = millis();
+        
+        // Also blink here to show life
+        digitalWrite(PIN_ONBOARD_LED, !digitalRead(PIN_ONBOARD_LED));
+
+        char ts[24];
+        if (rtc.isValid()) rtc.getTimestamp(ts, sizeof(ts));
+        else strcpy(ts, "--:--:--");
+
+        Serial.printf("[STATUS] %s | Level: %d%% (%s) | Temp: %.1fC | Circ: %s | Refill: %s\n",
+            ts,
+            waterLevel.getPercentage(), waterLevel.getStateName(),
+            temp.getCelsius(),
+            circulationPump.isOn() ? "ON" : "OFF",
+            refillPump.isOn() ? "ON" : "OFF"
+        );
+
+        // --- DIAGNOSTICS FOR USER ---
+        if (!rtc.isValid()) {
+            Serial.println("  [!] RTC INVALID. Checking specific addresses...");
+            i2cCheckSpecific();
+            // Try restart with force sync false
+            rtc.begin(false);
+        }
+        if (!temp.isValid()) {
+            Serial.println("  [!] TEMP SENSOR INVALID (Reads -127C). Check 4.7k Resistor & Pin 33.");
+        }
+        // -----------------------------
+    }
+}
