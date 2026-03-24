@@ -21,7 +21,7 @@ void printAddress(const DeviceAddress address) {
 		Serial.print(address[i], HEX);
 	}
 }
-}  // namespace
+}  
 
 void setup() {
 	Serial.begin(115200);
