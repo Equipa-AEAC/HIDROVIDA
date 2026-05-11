@@ -7,22 +7,14 @@
 #include <GravityTDS.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <cstdio>
 #include <cstring>
 
 namespace {
 constexpr uint8_t DS18B20_PIN = 3;
 constexpr uint8_t PH_PIN = 4;
 constexpr uint8_t TDS_PIN = 5;
-constexpr uint8_t TURBIDITY_PIN = 6;
-constexpr int8_t WS03_PIN = 7;
 constexpr uint8_t I2C_SDA_PIN = 8;
 constexpr uint8_t I2C_SCL_PIN = 9;
-
-constexpr uint8_t MICRONUTRIENTS_PUMP_PIN = 10;
-constexpr uint8_t CALCIUM_NITRATE_PUMP_PIN = 11;
-constexpr uint8_t POTASSIUM_NITRATE_PUMP_PIN = 12;
-constexpr uint8_t MAGNESIUM_SULFATE_PUMP_PIN = 13;
 
 constexpr int8_t TANK_1_DETECT_PIN = -1;
 constexpr int8_t TANK_2_DETECT_PIN = -1;
@@ -46,8 +38,6 @@ constexpr float PH_LOW = 5.5f;
 constexpr float PH_HIGH = 6.5f;
 constexpr float TDS_LOW = 500.0f;
 constexpr float TDS_HIGH = 1500.0f;
-constexpr float TURBIDITY_CLEAR_MV = 2500.0f;
-constexpr float TURBIDITY_DIRTY_MV = 1500.0f;
 constexpr int WATER_LOW_PERCENT = 20;
 
 constexpr uint8_t WATER_LOW_ADDR_PRIMARY = 0x77;
@@ -58,29 +48,11 @@ constexpr uint8_t WATER_HIGH_ADDR_ALT = 0x3C;
 // Adjust these to the real marks painted on your Grove 10 cm sensor.
 constexpr int TANK_1_MARK_PERCENT = 35;
 constexpr int TANK_2_MARK_PERCENT = 70;
-constexpr bool WS03_ACTIVE_LOW = true;
-constexpr uint8_t PUMP_ON_LEVEL = LOW;
-constexpr uint8_t PUMP_OFF_LEVEL = HIGH;
-constexpr size_t SERIAL_BUFFER_SIZE = 64;
 
 enum class DetectorState : uint8_t {
   Disabled,
   Detected,
   NotDetected,
-};
-
-enum class Ws03State : uint8_t {
-  Disabled,
-  LiquidDetected,
-  NoLiquid,
-};
-
-struct PumpChannel {
-  uint8_t pin;
-  const char* key;
-  const char* label;
-  bool running;
-  uint32_t stopAtMs;
 };
 
 OneWire oneWire(DS18B20_PIN);
@@ -92,26 +64,14 @@ Adafruit_SSD1306 display(DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, OLED_RESET_PIN);
 float g_temperatureC = NAN;
 float g_ph = NAN;
 float g_tdsPpm = NAN;
-float g_turbidityMv = NAN;
 int g_waterPercent = -1;
 DetectorState g_tank1State = DetectorState::Disabled;
 DetectorState g_tank2State = DetectorState::Disabled;
-Ws03State g_ws03State = Ws03State::Disabled;
 
 uint32_t g_lastSensorTickMs = 0;
 uint32_t g_lastDsRequestMs = 0;
 bool g_dsRequested = false;
 bool g_displayReady = false;
-
-PumpChannel g_pumps[] = {
-  {MICRONUTRIENTS_PUMP_PIN, "micro", "Micronutrients", false, 0},
-  {CALCIUM_NITRATE_PUMP_PIN, "calcium", "Calcium nitrate", false, 0},
-  {POTASSIUM_NITRATE_PUMP_PIN, "potassium", "Potassium nitrate", false, 0},
-  {MAGNESIUM_SULFATE_PUMP_PIN, "magnesium", "Magnesium sulfate", false, 0},
-};
-
-char g_serialBuffer[SERIAL_BUFFER_SIZE] = {0};
-size_t g_serialBufferLen = 0;
 
 float readAverageVoltageMv(uint8_t pin, uint8_t samples) {
   uint32_t sum = 0;
@@ -220,24 +180,11 @@ float readTDS(float temperatureC) {
   return readAverageTdsPpm(temp, ANALOG_SAMPLES);
 }
 
-float readTurbidityMv() {
-  return readAverageVoltageMv(TURBIDITY_PIN, ANALOG_SAMPLES);
-}
-
 DetectorState readDetector(int8_t pin) {
   if (pin < 0) {
     return DetectorState::Disabled;
   }
   return (digitalRead(pin) == LOW) ? DetectorState::Detected : DetectorState::NotDetected;
-}
-
-Ws03State readWs03(int8_t pin) {
-  if (pin < 0) {
-    return Ws03State::Disabled;
-  }
-
-  const bool active = WS03_ACTIVE_LOW ? (digitalRead(pin) == LOW) : (digitalRead(pin) == HIGH);
-  return active ? Ws03State::LiquidDetected : Ws03State::NoLiquid;
 }
 
 const char* detectorStateText(DetectorState state) {
@@ -247,19 +194,6 @@ const char* detectorStateText(DetectorState state) {
     case DetectorState::Detected:
       return "DETECTED";
     case DetectorState::NotDetected:
-      return "CLEAR";
-    default:
-      return "UNKNOWN";
-  }
-}
-
-const char* ws03StateText(Ws03State state) {
-  switch (state) {
-    case Ws03State::Disabled:
-      return "DISABLED";
-    case Ws03State::LiquidDetected:
-      return "LIQUID";
-    case Ws03State::NoLiquid:
       return "CLEAR";
     default:
       return "UNKNOWN";
@@ -302,141 +236,8 @@ const char* waterState(int value) {
   return "OK";
 }
 
-const char* turbidityState(float valueMv) {
-  if (!isfinite(valueMv)) {
-    return "ERR";
-  }
-  if (valueMv >= TURBIDITY_CLEAR_MV) {
-    return "CLEAR";
-  }
-  if (valueMv <= TURBIDITY_DIRTY_MV) {
-    return "DIRTY";
-  }
-  return "MID";
-}
-
 bool isWarnState(const char* state) {
   return strcmp(state, "OK") != 0;
-}
-
-bool shouldBlinkState(const char* state) {
-  return (strcmp(state, "OK") != 0) && (strcmp(state, "CLEAR") != 0);
-}
-
-void setPumpOutput(PumpChannel& pump, bool on) {
-  digitalWrite(pump.pin, on ? PUMP_ON_LEVEL : PUMP_OFF_LEVEL);
-  pump.running = on;
-  if (!on) {
-    pump.stopAtMs = 0;
-  }
-}
-
-void allPumpsOff() {
-  for (auto& pump : g_pumps) {
-    setPumpOutput(pump, false);
-  }
-}
-
-PumpChannel* findPumpByKey(const char* key) {
-  for (auto& pump : g_pumps) {
-    if (strcmp(key, pump.key) == 0) {
-      return &pump;
-    }
-  }
-
-  if ((strcmp(key, "micronutrients") == 0) || (strcmp(key, "micronutrientes") == 0)) {
-    return &g_pumps[0];
-  }
-  if ((strcmp(key, "calcium_nitrate") == 0) || (strcmp(key, "nitrato_calcio") == 0)) {
-    return &g_pumps[1];
-  }
-  if ((strcmp(key, "potassium_nitrate") == 0) || (strcmp(key, "nitrate_potassium") == 0) || (strcmp(key, "nitrato_potassio") == 0)) {
-    return &g_pumps[2];
-  }
-  if ((strcmp(key, "magnesium_sulfate") == 0) || (strcmp(key, "sulfato_magnesio") == 0) || (strcmp(key, "sufito_magnesio") == 0)) {
-    return &g_pumps[3];
-  }
-
-  return nullptr;
-}
-
-void startPumpDose(PumpChannel& pump, uint32_t durationMs, uint32_t now) {
-  if (durationMs == 0) {
-    setPumpOutput(pump, false);
-    return;
-  }
-
-  setPumpOutput(pump, true);
-  pump.stopAtMs = now + durationMs;
-  Serial.printf("[PUMP] %s ON for %lu ms\n", pump.label, static_cast<unsigned long>(durationMs));
-}
-
-void updatePumps(uint32_t now) {
-  for (auto& pump : g_pumps) {
-    if (!pump.running) {
-      continue;
-    }
-    if (static_cast<int32_t>(now - pump.stopAtMs) >= 0) {
-      setPumpOutput(pump, false);
-      Serial.printf("[PUMP] %s OFF\n", pump.label);
-    }
-  }
-}
-
-void printPumpStatus() {
-  for (const auto& pump : g_pumps) {
-    Serial.printf("[PUMP] %s=%s\n", pump.label, pump.running ? "ON" : "OFF");
-  }
-}
-
-void handleCommand(char* command, uint32_t now) {
-  if (strcmp(command, "status") == 0) {
-    printPumpStatus();
-    return;
-  }
-
-  if (strcmp(command, "alloff") == 0) {
-    allPumpsOff();
-    Serial.println("[PUMP] All pumps OFF");
-    return;
-  }
-
-  char action[16] = {0};
-  char target[24] = {0};
-  unsigned long durationMs = 0;
-
-  const int tokens = sscanf(command, "%15s %23s %lu", action, target, &durationMs);
-  if ((tokens == 3) && (strcmp(action, "dose") == 0)) {
-    PumpChannel* pump = findPumpByKey(target);
-    if (pump == nullptr) {
-      Serial.printf("[CMD] Unknown pump: %s\n", target);
-      return;
-    }
-    startPumpDose(*pump, static_cast<uint32_t>(durationMs), now);
-    return;
-  }
-
-  Serial.println("[CMD] Use: dose <pump> <ms> | alloff | status");
-}
-
-void handleSerialCommands(uint32_t now) {
-  while (Serial.available() > 0) {
-    const char ch = static_cast<char>(Serial.read());
-    if ((ch == '\r') || (ch == '\n')) {
-      if (g_serialBufferLen == 0) {
-        continue;
-      }
-      g_serialBuffer[g_serialBufferLen] = '\0';
-      handleCommand(g_serialBuffer, now);
-      g_serialBufferLen = 0;
-      g_serialBuffer[0] = '\0';
-      continue;
-    }
-
-    if (g_serialBufferLen < (SERIAL_BUFFER_SIZE - 1)) {
-      g_serialBuffer[g_serialBufferLen++] = ch;
-    }
-  }
 }
 
 void drawMetricLine(int16_t y, const char* label, float value, uint8_t decimals, const char* unit, const char* state, bool blinkOn) {
@@ -449,7 +250,7 @@ void drawMetricLine(int16_t y, const char* label, float value, uint8_t decimals,
   }
   display.print(unit);
 
-  if (shouldBlinkState(state) && blinkOn) {
+  if (isWarnState(state) && blinkOn) {
     display.print(" ");
     display.print(state);
   }
@@ -471,14 +272,6 @@ void drawWaterLine(int16_t y, int percentage, const char* state, bool blinkOn) {
   }
 }
 
-void drawTextLine(int16_t y, const char* text, bool warn, bool blinkOn) {
-  display.setCursor(0, y);
-  display.print(text);
-  if (warn && blinkOn) {
-    display.print(" !");
-  }
-}
-
 void drawDashboard(bool blinkOn) {
   if (!g_displayReady) {
     return;
@@ -488,31 +281,15 @@ void drawDashboard(bool blinkOn) {
   const char* pState = rangeState(g_ph, PH_LOW, PH_HIGH);
   const char* tdsState = rangeState(g_tdsPpm, TDS_LOW, TDS_HIGH);
   const char* wState = waterState(g_waterPercent);
-  const char* turbState = turbidityState(g_turbidityMv);
-  const bool pageTwo = ((millis() / 4000u) % 2u) != 0u;
 
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  if (!pageTwo) {
-    drawMetricLine(0, "Temp:", g_temperatureC, 1, "C", tState, blinkOn);
-    drawMetricLine(16, "pH:", g_ph, 2, "", pState, blinkOn);
-    drawMetricLine(32, "TDS:", g_tdsPpm, 0, "ppm", tdsState, blinkOn);
-    drawWaterLine(48, g_waterPercent, wState, blinkOn);
-  } else {
-    char line[32];
-    drawMetricLine(0, "Turb:", g_turbidityMv, 0, "mV", turbState, blinkOn);
-
-    snprintf(line, sizeof(line), "WS03:%s", ws03StateText(g_ws03State));
-    drawTextLine(16, line, g_ws03State == Ws03State::LiquidDetected, blinkOn);
-
-    snprintf(line, sizeof(line), "M:%s C:%s", g_pumps[0].running ? "ON" : "OFF", g_pumps[1].running ? "ON" : "OFF");
-    drawTextLine(32, line, g_pumps[0].running || g_pumps[1].running, blinkOn);
-
-    snprintf(line, sizeof(line), "P:%s Mg:%s", g_pumps[2].running ? "ON" : "OFF", g_pumps[3].running ? "ON" : "OFF");
-    drawTextLine(48, line, g_pumps[2].running || g_pumps[3].running, blinkOn);
-  }
+  drawMetricLine(0, "Temp:", g_temperatureC, 1, "C", tState, blinkOn);
+  drawMetricLine(16, "pH:", g_ph, 2, "", pState, blinkOn);
+  drawMetricLine(32, "TDS:", g_tdsPpm, 0, "ppm", tdsState, blinkOn);
+  drawWaterLine(48, g_waterPercent, wState, blinkOn);
 
   display.display();
 }
@@ -540,21 +317,14 @@ void scanI2CBus() {
 }
 
 void printSerialStatus() {
-  Serial.printf("Temp=%.1fC, pH=%.2f, TDS=%.0fppm, Turb=%.0fmV(%s), Water=%d%%, Zone=%s, WS03=%s, Tank1=%s, Tank2=%s, Micro=%s, CaNO3=%s, KNO3=%s, MgSO4=%s\n",
+  Serial.printf("Temp=%.1fC, pH=%.2f, TDS=%.0fppm, Water=%d%%, Zone=%s, Tank1=%s, Tank2=%s\n",
                 g_temperatureC,
                 g_ph,
                 g_tdsPpm,
-                g_turbidityMv,
-                turbidityState(g_turbidityMv),
                 g_waterPercent,
                 tankZoneText(g_waterPercent),
-                ws03StateText(g_ws03State),
                 detectorStateText(g_tank1State),
-                detectorStateText(g_tank2State),
-                g_pumps[0].running ? "ON" : "OFF",
-                g_pumps[1].running ? "ON" : "OFF",
-                g_pumps[2].running ? "ON" : "OFF",
-                g_pumps[3].running ? "ON" : "OFF");
+                detectorStateText(g_tank2State));
 }
 }  // namespace
 
@@ -568,7 +338,6 @@ void setup() {
   analogReadResolution(12);
   analogSetPinAttenuation(PH_PIN, ADC_11db);
   analogSetPinAttenuation(TDS_PIN, ADC_11db);
-  analogSetPinAttenuation(TURBIDITY_PIN, ADC_11db);
 
   EEPROM.begin(64);
 
@@ -591,14 +360,6 @@ void setup() {
   if (TANK_2_DETECT_PIN >= 0) {
     pinMode(TANK_2_DETECT_PIN, INPUT_PULLUP);
   }
-  if (WS03_PIN >= 0) {
-    pinMode(WS03_PIN, INPUT_PULLUP);
-  }
-
-  for (auto& pump : g_pumps) {
-    pinMode(pump.pin, OUTPUT);
-  }
-  allPumpsOff();
 
   scanI2CBus();
 
@@ -618,15 +379,10 @@ void setup() {
   Serial.println("[INFO] Hydroponics dashboard started.");
   Serial.printf("[INFO] Tank 1 water mark: %d%%\n", TANK_1_MARK_PERCENT);
   Serial.printf("[INFO] Tank 2 water mark: %d%%\n", TANK_2_MARK_PERCENT);
-  Serial.println("[INFO] Pump commands: dose <pump> <ms> | alloff | status");
-  Serial.println("[INFO] Pumps: micro, calcium, potassium, magnesium");
 }
 
 void loop() {
   const uint32_t now = millis();
-
-  handleSerialCommands(now);
-  updatePumps(now);
 
   if (g_dsRequested && (now - g_lastDsRequestMs >= DS18B20_CONVERSION_MS)) {
     g_temperatureC = readTemperature();
@@ -644,9 +400,7 @@ void loop() {
 
     g_ph = readPH();
     g_tdsPpm = readTDS(g_temperatureC);
-    g_turbidityMv = readTurbidityMv();
     g_waterPercent = readWaterLevelPercentage();
-    g_ws03State = readWs03(WS03_PIN);
     g_tank1State = readDetector(TANK_1_DETECT_PIN);
     g_tank2State = readDetector(TANK_2_DETECT_PIN);
     printSerialStatus();
