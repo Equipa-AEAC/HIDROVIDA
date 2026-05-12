@@ -19,6 +19,10 @@ constexpr int8_t WS03_PIN = 7;
 constexpr uint8_t I2C_SDA_PIN = 8;
 constexpr uint8_t I2C_SCL_PIN = 9;
 
+constexpr uint8_t MICRONUTRIENTS_PUMP_PIN = 10;
+constexpr uint8_t CALCIUM_NITRATE_PUMP_PIN = 11;
+constexpr uint8_t POTASSIUM_NITRATE_PUMP_PIN = 12;
+constexpr uint8_t MAGNESIUM_SULFATE_PUMP_PIN = 13;
 
 constexpr int8_t TANK_1_DETECT_PIN = -1;
 constexpr int8_t TANK_2_DETECT_PIN = -1;
