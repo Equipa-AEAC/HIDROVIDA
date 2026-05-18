@@ -4,654 +4,760 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <DFRobot_ESP_PH.h>
+#ifdef ReceivedBufferLength
+#undef ReceivedBufferLength
+#endif
 #include <GravityTDS.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <garden.h>
+#include <hydro_lcd_data.h>
+#include <hardware/pin_map.h>
 #include <cstdio>
 #include <cstring>
 
 namespace {
-constexpr uint8_t DS18B20_PIN = 3;
-constexpr uint8_t PH_PIN = 4;
-constexpr uint8_t TDS_PIN = 5;
-constexpr uint8_t TURBIDITY_PIN = 6;
-constexpr int8_t WS03_PIN = 7;
-constexpr uint8_t I2C_SDA_PIN = 8;
-constexpr uint8_t I2C_SCL_PIN = 9;
 
-constexpr uint8_t MICRONUTRIENTS_PUMP_PIN = 10;
-constexpr uint8_t CALCIUM_NITRATE_PUMP_PIN = 11;
-constexpr uint8_t POTASSIUM_NITRATE_PUMP_PIN = 12;
-constexpr uint8_t MAGNESIUM_SULFATE_PUMP_PIN = 13;
+// ============================================================================
+// Configuracao de hardware
+// ============================================================================
 
-constexpr int8_t TANK_1_DETECT_PIN = -1;
-constexpr int8_t TANK_2_DETECT_PIN = -1;
+using HardwarePinos::PINO_BOMBA_MICRONUTRIENTES;
+using HardwarePinos::PINO_BOMBA_NITRATO_CALCIO;
+using HardwarePinos::PINO_BOMBA_NITRATO_POTASSIO;
+using HardwarePinos::PINO_BOMBA_SULFATO_MAGNESIO;
+using HardwarePinos::PINO_CO2_ANALOGICO;
+using HardwarePinos::PINO_DHT22_DADOS;
+using HardwarePinos::PINO_DS18B20_DADOS;
+using HardwarePinos::PINO_PH_ANALOGICO;
+using HardwarePinos::PINO_REPOSICAO_SENSOR_LIMITE;
+using HardwarePinos::PINO_TANQUE1_SCL;
+using HardwarePinos::PINO_TANQUE1_SDA;
+using HardwarePinos::PINO_TANQUE2_SCL;
+using HardwarePinos::PINO_TANQUE2_SDA;
+using HardwarePinos::PINO_TDS_ANALOGICO;
+using HardwarePinos::PINO_TURBIDEZ_ANALOGICO;
 
-constexpr uint16_t DISPLAY_WIDTH = 128;
-constexpr uint16_t DISPLAY_HEIGHT = 64;
-constexpr uint8_t OLED_RESET_PIN = 255;
-constexpr uint8_t OLED_I2C_ADDR = 0x3C;
+constexpr bool SENSOR_DHT22_ATIVO = true;
+constexpr bool SENSOR_CO2_ATIVO = false;
+constexpr bool SENSOR_REPOSICAO_ATIVO_EM_BAIXO = true;
 
-constexpr uint32_t SENSOR_INTERVAL_MS = 1000;
-constexpr uint32_t DS18B20_CONVERSION_MS = 750;
+constexpr uint8_t DHT22_TIPO = DHT22;
+constexpr size_t EEPROM_TAMANHO_BYTES = 64;
 
-constexpr uint8_t ANALOG_SAMPLES = 10;
-constexpr float ADC_MAX = 4095.0f;
-constexpr float ADC_REF_MV = 3300.0f;
-constexpr float DEFAULT_TEMP_C = 25.0f;
+// ============================================================================
+// Temporizacao do sistema
+// ============================================================================
 
-constexpr float TEMP_LOW_C = 18.0f;
-constexpr float TEMP_HIGH_C = 28.0f;
-constexpr float PH_LOW = 5.5f;
-constexpr float PH_HIGH = 6.5f;
-constexpr float TDS_LOW = 500.0f;
-constexpr float TDS_HIGH = 1500.0f;
-constexpr float TURBIDITY_CLEAR_MV = 2500.0f;
-constexpr float TURBIDITY_DIRTY_MV = 1500.0f;
-constexpr int WATER_LOW_PERCENT = 20;
+constexpr uint32_t SISTEMA_INTERVALO_LEITURA_MS = 1000;
+constexpr uint32_t DS18B20_TEMPO_CONVERSAO_MS = 750;
+constexpr uint32_t DHT22_INTERVALO_LEITURA_MS = 2500;
+constexpr uint32_t NUTRIENTES_COOLDOWN_DOSAGEM_MS = 120000;
+constexpr uint32_t NUTRIENTES_TEMPO_MISTURA_MS = 45000;
 
-constexpr uint8_t WATER_LOW_ADDR_PRIMARY = 0x77;
-constexpr uint8_t WATER_HIGH_ADDR_PRIMARY = 0x78;
-constexpr uint8_t WATER_LOW_ADDR_ALT = 0x3B;
-constexpr uint8_t WATER_HIGH_ADDR_ALT = 0x3C;
+// ============================================================================
+// Parametros ADC
+// ============================================================================
 
-// Adjust these to the real marks painted on your Grove 10 cm sensor.
-constexpr int TANK_1_MARK_PERCENT = 35;
-constexpr int TANK_2_MARK_PERCENT = 70;
-constexpr bool WS03_ACTIVE_LOW = true;
-constexpr uint8_t PUMP_ON_LEVEL = LOW;
-constexpr uint8_t PUMP_OFF_LEVEL = HIGH;
-constexpr size_t SERIAL_BUFFER_SIZE = 64;
+constexpr uint8_t ADC_NUMERO_AMOSTRAS = 10;
+constexpr float ADC_VALOR_MAXIMO = 4095.0f;
+constexpr float ADC_REFERENCIA_MV = 3300.0f;
+constexpr float TEMPERATURA_PADRAO_C = 25.0f;
 
-enum class DetectorState : uint8_t {
-  Disabled,
-  Detected,
-  NotDetected,
+// ============================================================================
+// Limites de operacao
+// ============================================================================
+
+constexpr float DS18B20_TEMPERATURA_MIN_C = 18.0f;
+constexpr float DS18B20_TEMPERATURA_MAX_C = 28.0f;
+
+constexpr float TURBIDEZ_TENSAO_LIMPA_MV = 2500.0f;
+constexpr float TURBIDEZ_TENSAO_SUJA_MV = 1500.0f;
+
+constexpr float DHT22_HUMIDADE_MIN_PERCENT = 40.0f;
+constexpr float DHT22_HUMIDADE_MAX_PERCENT = 75.0f;
+constexpr float CO2_LIMITE_ALTO_PPM = 1400.0f;
+
+constexpr float TANQUE1_ALTURA_TOTAL_CM = 10.0f;
+constexpr float TANQUE2_ALTURA_TOTAL_CM = 18.0f;
+constexpr float GROVE_NIVEL_FAIXA_SENSOR_CM = 10.0f;
+constexpr float TANQUE_PRINCIPAL_NIVEL_BAIXO_PERCENT = 20.0f;
+
+// ============================================================================
+// Enderecos I2C dos sensores Grove water level
+// ============================================================================
+
+constexpr uint8_t GROVE_NIVEL_ENDERECO_BAIXO_PRIMARIO = 0x77;
+constexpr uint8_t GROVE_NIVEL_ENDERECO_ALTO_PRIMARIO = 0x78;
+constexpr uint8_t GROVE_NIVEL_ENDERECO_BAIXO_ALTERNATIVO = 0x3B;
+constexpr uint8_t GROVE_NIVEL_ENDERECO_ALTO_ALTERNATIVO = 0x3C;
+
+// ============================================================================
+// Parametros das bombas e EEPROM
+// ============================================================================
+
+constexpr uint8_t BOMBA_NIVEL_LIGADA = LOW;
+constexpr uint8_t BOMBA_NIVEL_DESLIGADA = HIGH;
+
+constexpr uint32_t EEPROM_ASSINATURA_CONFIG = 0x4844524Fu;
+constexpr int EEPROM_ENDERECO_CONFIG = 0;
+constexpr float TDS_AJUSTE_AR_PADRAO_PPM = 40.0f;
+constexpr float TDS_MARGEM_AR_PPM = 5.0f;
+
+// ============================================================================
+// Estruturas de configuracao
+// ============================================================================
+
+struct ConfiguracaoSistema {
+  uint32_t configuracaoAssinatura;
+  float sensorTdsValorArPpm;
+  float sensorTdsLimiteArPpm;
 };
 
-enum class Ws03State : uint8_t {
-  Disabled,
-  LiquidDetected,
-  NoLiquid,
+enum class FaseCrescimento : uint8_t {
+  Germinacao,
+  Vegetativo,
+  Floracao,
 };
 
-struct PumpChannel {
-  uint8_t pin;
-  const char* key;
-  const char* label;
-  bool running;
-  uint32_t stopAtMs;
+enum class EstadoTanqueReposicao : uint8_t {
+  Baixo,
+  OK,
 };
 
-OneWire oneWire(DS18B20_PIN);
-DallasTemperature ds18b20(&oneWire);
-DFRobot_ESP_PH ph;
-GravityTDS tds;
-Adafruit_SSD1306 display(DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, OLED_RESET_PIN);
-
-float g_temperatureC = NAN;
-float g_ph = NAN;
-float g_tdsPpm = NAN;
-float g_turbidityMv = NAN;
-int g_waterPercent = -1;
-DetectorState g_tank1State = DetectorState::Disabled;
-DetectorState g_tank2State = DetectorState::Disabled;
-Ws03State g_ws03State = Ws03State::Disabled;
-
-uint32_t g_lastSensorTickMs = 0;
-uint32_t g_lastDsRequestMs = 0;
-bool g_dsRequested = false;
-bool g_displayReady = false;
-
-PumpChannel g_pumps[] = {
-  {MICRONUTRIENTS_PUMP_PIN, "micro", "Micronutrients", false, 0},
-  {CALCIUM_NITRATE_PUMP_PIN, "calcium", "Calcium nitrate", false, 0},
-  {POTASSIUM_NITRATE_PUMP_PIN, "potassium", "Potassium nitrate", false, 0},
-  {MAGNESIUM_SULFATE_PUMP_PIN, "magnesium", "Magnesium sulfate", false, 0},
+struct CanalBombaNutriente {
+  uint8_t bombaPino;
+  const char* bombaNome;
+  float bombaMlPorSegundo;
+  bool bombaLigada;
+  uint32_t bombaMomentoDesligarMs;
 };
 
-char g_serialBuffer[SERIAL_BUFFER_SIZE] = {0};
-size_t g_serialBufferLen = 0;
+struct PerfilCrescimento {
+  FaseCrescimento perfilFase;
+  const char* perfilNome;
+  float perfilTdsAlvoPpm;
+  float perfilTdsAcionamentoPpm;
+  float perfilPhMinimo;
+  float perfilPhMaximo;
+  float perfilDoseMicronutrientesMl;
+  float perfilDoseNitratoCalcioMl;
+  float perfilDoseNitratoPotassioMl;
+  float perfilDoseSulfatoMagnesioMl;
+};
 
-float readAverageVoltageMv(uint8_t pin, uint8_t samples) {
-  uint32_t sum = 0;
-  for (uint8_t i = 0; i < samples; i++) {
-    sum += static_cast<uint32_t>(analogRead(pin));
+// ============================================================================
+// Perfil ativo do sistema
+// ============================================================================
+
+constexpr FaseCrescimento PERFIL_CRESCIMENTO_ATIVO = FaseCrescimento::Vegetativo;
+
+constexpr PerfilCrescimento PERFIS_CRESCIMENTO[] = {
+    {FaseCrescimento::Germinacao, "GERM", 450.0f, 380.0f, 5.6f, 6.2f, 0.8f, 1.0f, 0.8f, 0.6f},
+    {FaseCrescimento::Vegetativo, "VEG", 850.0f, 780.0f, 5.8f, 6.2f, 1.2f, 2.2f, 1.8f, 1.0f},
+    {FaseCrescimento::Floracao, "FLOR", 1050.0f, 950.0f, 5.8f, 6.3f, 1.0f, 1.8f, 2.6f, 1.2f},
+};
+
+// ============================================================================
+// Objetos de hardware
+// ============================================================================
+
+TwoWire barramentoI2cTanque2 = TwoWire(1);
+OneWire barramentoOneWireDs18b20(PINO_DS18B20_DADOS);
+DallasTemperature sensorDs18b20(&barramentoOneWireDs18b20);
+DFRobot_ESP_PH sensorPh;
+GravityTDS sensorTds;
+DHT sensorDht22(PINO_DHT22_DADOS, DHT22_TIPO);
+
+// ============================================================================
+// Estado persistente do sistema
+// ============================================================================
+
+ConfiguracaoSistema configuracaoSistema = {
+    EEPROM_ASSINATURA_CONFIG,
+    0.0f,
+    TDS_AJUSTE_AR_PADRAO_PPM,
+};
+
+CanalBombaNutriente canaisBombasNutrientes[] = {
+    {PINO_BOMBA_MICRONUTRIENTES, "Micro", 1.00f, false, 0},
+    {PINO_BOMBA_NITRATO_CALCIO, "CaNO3", 1.00f, false, 0},
+    {PINO_BOMBA_NITRATO_POTASSIO, "KNO3", 1.00f, false, 0},
+    {PINO_BOMBA_SULFATO_MAGNESIO, "MgSO4", 1.00f, false, 0},
+};
+
+// ============================================================================
+// Leituras atuais dos sensores
+// ============================================================================
+
+float leituraDs18b20TemperaturaC = NAN;
+
+float leituraPhValor = NAN;
+float leituraPhTensaoMv = NAN;
+
+float leituraTdsValorPpm = NAN;
+float leituraTdsValorBrutoPpm = NAN;
+float leituraTdsEcUsCm = NAN;
+float leituraTdsTensaoMv = NAN;
+
+float leituraTurbidezTensaoMv = NAN;
+int leituraTurbidezAdc = -1;
+int leituraTurbidezAdcMin = 4095;
+int leituraTurbidezAdcMax = 0;
+
+float leituraDht22HumidadePercent = NAN;
+float leituraCo2ValorPpm = NAN;
+
+float leituraTanque1NivelCm = NAN;
+float leituraTanque2NivelCm = NAN;
+float leituraTanque1Percent = NAN;
+float leituraTanque2Percent = NAN;
+EstadoTanqueReposicao leituraReposicaoEstado = EstadoTanqueReposicao::Baixo;
+
+// ============================================================================
+// Estado de controlo temporal
+// ============================================================================
+
+uint32_t sistemaUltimoCicloSensoresMs = 0;
+uint32_t ds18b20UltimoPedidoMs = 0;
+uint32_t dht22UltimaLeituraMs = 0;
+uint32_t nutrientesUltimaDosagemMs = 0;
+uint32_t nutrientesMisturaAteMs = 0;
+
+bool ds18b20ConversaoPendente = false;
+void guardarConfiguracaoSistema() {
+  EEPROM.put(EEPROM_ENDERECO_CONFIG, configuracaoSistema);
+  EEPROM.commit();
+}
+
+void carregarConfiguracaoSistema() {
+  EEPROM.get(EEPROM_ENDERECO_CONFIG, configuracaoSistema);
+  const bool configuracaoInvalida =
+      configuracaoSistema.configuracaoAssinatura != EEPROM_ASSINATURA_CONFIG ||
+      !isfinite(configuracaoSistema.sensorTdsLimiteArPpm) ||
+      configuracaoSistema.sensorTdsLimiteArPpm < 0.0f ||
+      configuracaoSistema.sensorTdsLimiteArPpm > 200.0f;
+
+  if (configuracaoInvalida) {
+    configuracaoSistema.configuracaoAssinatura = EEPROM_ASSINATURA_CONFIG;
+    configuracaoSistema.sensorTdsValorArPpm = 0.0f;
+    configuracaoSistema.sensorTdsLimiteArPpm = TDS_AJUSTE_AR_PADRAO_PPM;
+    guardarConfiguracaoSistema();
+  }
+}
+
+const PerfilCrescimento& obterPerfilCrescimentoAtivo() {
+  for (const auto& perfilAtual : PERFIS_CRESCIMENTO) {
+    if (perfilAtual.perfilFase == PERFIL_CRESCIMENTO_ATIVO) {
+      return perfilAtual;
+    }
+  }
+  return PERFIS_CRESCIMENTO[0];
+}
+
+// ============================================================================
+// Funcoes auxiliares ADC
+// ============================================================================
+
+float calcularMediaAdcContagens(uint8_t pinoAdc, uint8_t numeroAmostras) {
+  uint32_t somaLeituras = 0;
+  for (uint8_t indiceAmostra = 0; indiceAmostra < numeroAmostras; indiceAmostra++) {
+    somaLeituras += static_cast<uint32_t>(analogRead(pinoAdc));
     delay(10);
   }
-  const float avg = static_cast<float>(sum) / static_cast<float>(samples);
-  return (avg / ADC_MAX) * ADC_REF_MV;
+  return static_cast<float>(somaLeituras) / static_cast<float>(numeroAmostras);
 }
 
-float readAverageTdsPpm(float temperatureC, uint8_t samples) {
-  float sum = 0.0f;
-  for (uint8_t i = 0; i < samples; i++) {
-    tds.setTemperature(temperatureC);
-    tds.update();
-    sum += tds.getTdsValue();
+float calcularMediaAdcMv(uint8_t pinoAdc, uint8_t numeroAmostras) {
+  const float mediaContagens = calcularMediaAdcContagens(pinoAdc, numeroAmostras);
+  return (mediaContagens / ADC_VALOR_MAXIMO) * ADC_REFERENCIA_MV;
+}
+
+// ============================================================================
+// Leituras dos sensores analogicos e digitais
+// ============================================================================
+
+float lerDs18b20TemperaturaC() {
+  const float temperaturaC = sensorDs18b20.getTempCByIndex(0);
+  if (temperaturaC == DEVICE_DISCONNECTED_C) {
+    return NAN;
+  }
+  return temperaturaC;
+}
+
+float lerPhValor() {
+  const float temperaturaCompensacao = isfinite(leituraDs18b20TemperaturaC) ? leituraDs18b20TemperaturaC : TEMPERATURA_PADRAO_C;
+  leituraPhTensaoMv = calcularMediaAdcMv(PINO_PH_ANALOGICO, ADC_NUMERO_AMOSTRAS);
+  return sensorPh.readPH(leituraPhTensaoMv, temperaturaCompensacao);
+}
+
+float lerTdsValorPpm(float temperaturaC) {
+  const float temperaturaCompensacao = isfinite(temperaturaC) ? temperaturaC : TEMPERATURA_PADRAO_C;
+
+  leituraTdsTensaoMv = calcularMediaAdcMv(PINO_TDS_ANALOGICO, ADC_NUMERO_AMOSTRAS);
+
+  float somaTdsPpm = 0.0f;
+  for (uint8_t indiceAmostra = 0; indiceAmostra < ADC_NUMERO_AMOSTRAS; indiceAmostra++) {
+    sensorTds.setTemperature(temperaturaCompensacao);
+    sensorTds.update();
+    somaTdsPpm += sensorTds.getTdsValue();
     delay(20);
   }
-  return sum / static_cast<float>(samples);
+
+  leituraTdsValorBrutoPpm = somaTdsPpm / static_cast<float>(ADC_NUMERO_AMOSTRAS);
+  leituraTdsEcUsCm = sensorTds.getEcValue();
+
+  if (!isfinite(leituraTdsValorBrutoPpm)) {
+    return leituraTdsValorBrutoPpm;
+  }
+  if (leituraTdsValorBrutoPpm <= configuracaoSistema.sensorTdsLimiteArPpm) {
+    return 0.0f;
+  }
+  return leituraTdsValorBrutoPpm;
 }
 
-bool readWaterFrame(uint8_t lowAddr, uint8_t highAddr, uint8_t* lowData, uint8_t* highData) {
-  const int lowCount = Wire.requestFrom(static_cast<int>(lowAddr), 8);
-  if (lowCount != 8) {
-    return false;
+float lerTurbidezTensaoMv() {
+  const float mediaAdc = calcularMediaAdcContagens(PINO_TURBIDEZ_ANALOGICO, ADC_NUMERO_AMOSTRAS);
+
+  leituraTurbidezAdc = static_cast<int>(mediaAdc + 0.5f);
+  if (leituraTurbidezAdc < leituraTurbidezAdcMin) {
+    leituraTurbidezAdcMin = leituraTurbidezAdc;
   }
-  for (int i = 0; i < 8; i++) {
-    lowData[i] = Wire.read();
+  if (leituraTurbidezAdc > leituraTurbidezAdcMax) {
+    leituraTurbidezAdcMax = leituraTurbidezAdc;
   }
 
-  const int highCount = Wire.requestFrom(static_cast<int>(highAddr), 12);
-  if (highCount != 12) {
+  return (mediaAdc / ADC_VALOR_MAXIMO) * ADC_REFERENCIA_MV;
+}
+
+float lerDht22HumidadePercent() {
+  if (!SENSOR_DHT22_ATIVO) {
+    return NAN;
+  }
+
+  const uint32_t momentoAtualMs = millis();
+  if ((dht22UltimaLeituraMs != 0) &&
+      (momentoAtualMs - dht22UltimaLeituraMs < DHT22_INTERVALO_LEITURA_MS) &&
+      isfinite(leituraDht22HumidadePercent)) {
+    return leituraDht22HumidadePercent;
+  }
+
+  dht22UltimaLeituraMs = momentoAtualMs;
+  const float humidadeLida = sensorDht22.readHumidity();
+  if (isnan(humidadeLida)) {
+    return NAN;
+  }
+  return constrain(humidadeLida, 0.0f, 100.0f);
+}
+
+float lerCo2Ppm() {
+  if (!SENSOR_CO2_ATIVO) {
+    return NAN;
+  }
+
+  const float tensaoCo2Mv = calcularMediaAdcMv(PINO_CO2_ANALOGICO, ADC_NUMERO_AMOSTRAS);
+  return constrain((tensaoCo2Mv / ADC_REFERENCIA_MV) * 5000.0f, 0.0f, 5000.0f);
+}
+
+// ============================================================================
+// Leitura dos sensores Grove de nivel de agua
+// ============================================================================
+
+bool lerGroveNivelFrame(TwoWire& barramentoI2c, uint8_t enderecoBaixo, uint8_t enderecoAlto, uint8_t* bufferBaixo, uint8_t* bufferAlto) {
+  const int bytesBaixos = barramentoI2c.requestFrom(static_cast<int>(enderecoBaixo), 8);
+  if (bytesBaixos != 8) {
     return false;
   }
-  for (int i = 0; i < 12; i++) {
-    highData[i] = Wire.read();
+  for (int indice = 0; indice < 8; indice++) {
+    bufferBaixo[indice] = barramentoI2c.read();
+  }
+
+  const int bytesAltos = barramentoI2c.requestFrom(static_cast<int>(enderecoAlto), 12);
+  if (bytesAltos != 12) {
+    return false;
+  }
+  for (int indice = 0; indice < 12; indice++) {
+    bufferAlto[indice] = barramentoI2c.read();
   }
   return true;
 }
 
-int touchedSectionsFromRaw(const uint8_t* lowData, const uint8_t* highData) {
-  constexpr int threshold = 100;
-  uint32_t touchMask = 0;
+int converterGroveNivelSecoes(const uint8_t* bufferBaixo, const uint8_t* bufferAlto) {
+  constexpr int limiarToque = 100;
+  uint32_t mascaraToque = 0;
 
-  for (int i = 0; i < 8; i++) {
-    if (lowData[i] > threshold) {
-      touchMask |= static_cast<uint32_t>(1) << i;
+  for (int indice = 0; indice < 8; indice++) {
+    if (bufferBaixo[indice] > limiarToque) {
+      mascaraToque |= static_cast<uint32_t>(1) << indice;
     }
   }
 
-  for (int i = 0; i < 12; i++) {
-    if (highData[i] > threshold) {
-      touchMask |= static_cast<uint32_t>(1) << (8 + i);
+  for (int indice = 0; indice < 12; indice++) {
+    if (bufferAlto[indice] > limiarToque) {
+      mascaraToque |= static_cast<uint32_t>(1) << (8 + indice);
     }
   }
 
-  int sections = 0;
-  while (touchMask & 0x01u) {
-    sections++;
-    touchMask >>= 1;
+  int secoesAtivas = 0;
+  while (mascaraToque & 0x01u) {
+    secoesAtivas++;
+    mascaraToque >>= 1;
   }
-  return sections;
+  return secoesAtivas;
 }
 
-int readWaterLevelPercentage() {
-  uint8_t lowData[8] = {0};
-  uint8_t highData[12] = {0};
+float lerTanquePrincipalNivelCm(TwoWire& barramentoI2c) {
+  uint8_t bufferBaixo[8] = {0};
+  uint8_t bufferAlto[12] = {0};
 
-  bool ok = readWaterFrame(WATER_LOW_ADDR_PRIMARY, WATER_HIGH_ADDR_PRIMARY, lowData, highData);
-  if (!ok) {
-    ok = readWaterFrame(WATER_LOW_ADDR_ALT, WATER_HIGH_ADDR_ALT, lowData, highData);
-  }
-  if (!ok) {
-    return -1;
+  bool leituraOk = lerGroveNivelFrame(
+      barramentoI2c,
+      GROVE_NIVEL_ENDERECO_BAIXO_PRIMARIO,
+      GROVE_NIVEL_ENDERECO_ALTO_PRIMARIO,
+      bufferBaixo,
+      bufferAlto);
+
+  if (!leituraOk) {
+    leituraOk = lerGroveNivelFrame(
+        barramentoI2c,
+        GROVE_NIVEL_ENDERECO_BAIXO_ALTERNATIVO,
+        GROVE_NIVEL_ENDERECO_ALTO_ALTERNATIVO,
+        bufferBaixo,
+        bufferAlto);
   }
 
-  int computed = touchedSectionsFromRaw(lowData, highData) * 5;
-  if (computed < 0) {
-    computed = 0;
-  }
-  if (computed > 100) {
-    computed = 100;
-  }
-  return computed;
-}
-
-float readTemperature() {
-  const float tempC = ds18b20.getTempCByIndex(0);
-  if (tempC == DEVICE_DISCONNECTED_C) {
+  if (!leituraOk) {
     return NAN;
   }
-  return tempC;
+
+  const int secoesAtivas = converterGroveNivelSecoes(bufferBaixo, bufferAlto);
+  return constrain(static_cast<float>(secoesAtivas) * 0.5f, 0.0f, GROVE_NIVEL_FAIXA_SENSOR_CM);
 }
 
-float readPH() {
-  const float temp = isfinite(g_temperatureC) ? g_temperatureC : DEFAULT_TEMP_C;
-  const float voltageMv = readAverageVoltageMv(PH_PIN, ANALOG_SAMPLES);
-  const float value = ph.readPH(voltageMv, temp);
-  ph.calibration(voltageMv, temp);
-  return value;
-}
-
-float readTDS(float temperatureC) {
-  const float temp = isfinite(temperatureC) ? temperatureC : DEFAULT_TEMP_C;
-  return readAverageTdsPpm(temp, ANALOG_SAMPLES);
-}
-
-float readTurbidityMv() {
-  return readAverageVoltageMv(TURBIDITY_PIN, ANALOG_SAMPLES);
-}
-
-DetectorState readDetector(int8_t pin) {
-  if (pin < 0) {
-    return DetectorState::Disabled;
+float converterTanqueNivelParaPercent(float nivelCm, float alturaTanqueCm) {
+  if (!isfinite(nivelCm) || alturaTanqueCm <= 0.0f) {
+    return NAN;
   }
-  return (digitalRead(pin) == LOW) ? DetectorState::Detected : DetectorState::NotDetected;
+  return constrain((nivelCm / alturaTanqueCm) * 100.0f, 0.0f, 100.0f);
 }
 
-Ws03State readWs03(int8_t pin) {
-  if (pin < 0) {
-    return Ws03State::Disabled;
-  }
-
-  const bool active = WS03_ACTIVE_LOW ? (digitalRead(pin) == LOW) : (digitalRead(pin) == HIGH);
-  return active ? Ws03State::LiquidDetected : Ws03State::NoLiquid;
+EstadoTanqueReposicao lerReposicaoEstado() {
+  const bool sensorAtivo = SENSOR_REPOSICAO_ATIVO_EM_BAIXO
+                               ? (digitalRead(PINO_REPOSICAO_SENSOR_LIMITE) == LOW)
+                               : (digitalRead(PINO_REPOSICAO_SENSOR_LIMITE) == HIGH);
+  return sensorAtivo ? EstadoTanqueReposicao::OK : EstadoTanqueReposicao::Baixo;
 }
 
-const char* detectorStateText(DetectorState state) {
-  switch (state) {
-    case DetectorState::Disabled:
-      return "DISABLED";
-    case DetectorState::Detected:
-      return "DETECTED";
-    case DetectorState::NotDetected:
-      return "CLEAR";
-    default:
-      return "UNKNOWN";
-  }
+// ============================================================================
+// Funcoes auxiliares de estado
+// ============================================================================
+
+const char* textoEstadoReposicao(EstadoTanqueReposicao estadoReposicao) {
+  return (estadoReposicao == EstadoTanqueReposicao::OK) ? "OK" : "LOW";
 }
 
-const char* ws03StateText(Ws03State state) {
-  switch (state) {
-    case Ws03State::Disabled:
-      return "DISABLED";
-    case Ws03State::LiquidDetected:
-      return "LIQUID";
-    case Ws03State::NoLiquid:
-      return "CLEAR";
-    default:
-      return "UNKNOWN";
-  }
-}
-
-const char* tankZoneText(int percentage) {
-  if (percentage < 0) {
-    return "sensor_error";
-  }
-  if (percentage < TANK_1_MARK_PERCENT) {
-    return "below_tank_1_mark";
-  }
-  if (percentage < TANK_2_MARK_PERCENT) {
-    return "between_tank_1_and_tank_2";
-  }
-  return "above_tank_2_mark";
-}
-
-const char* rangeState(float value, float low, float high) {
-  if (!isfinite(value)) {
+const char* textoEstadoFaixa(float valorAtual, float minimoAceitavel, float maximoAceitavel) {
+  if (!isfinite(valorAtual)) {
     return "ERR";
   }
-  if (value < low) {
+  if (valorAtual < minimoAceitavel) {
     return "LOW";
   }
-  if (value > high) {
+  if (valorAtual > maximoAceitavel) {
     return "HIGH";
   }
   return "OK";
 }
 
-const char* waterState(int value) {
-  if (value < 0 || value > 100) {
+const char* textoEstadoTurbidez(float tensaoMv) {
+  if (!isfinite(tensaoMv)) {
     return "ERR";
   }
-  if (value < WATER_LOW_PERCENT) {
-    return "LOW";
-  }
-  return "OK";
-}
-
-const char* turbidityState(float valueMv) {
-  if (!isfinite(valueMv)) {
-    return "ERR";
-  }
-  if (valueMv >= TURBIDITY_CLEAR_MV) {
+  if (tensaoMv >= TURBIDEZ_TENSAO_LIMPA_MV) {
     return "CLEAR";
   }
-  if (valueMv <= TURBIDITY_DIRTY_MV) {
+  if (tensaoMv <= TURBIDEZ_TENSAO_SUJA_MV) {
     return "DIRTY";
   }
   return "MID";
 }
 
-bool isWarnState(const char* state) {
-  return strcmp(state, "OK") != 0;
+const char* textoEstadoDht22Humidade(float humidadePercent) {
+  if (!isfinite(humidadePercent)) {
+    return "NA";
+  }
+  if (humidadePercent < DHT22_HUMIDADE_MIN_PERCENT) {
+    return "LOW";
+  }
+  if (humidadePercent > DHT22_HUMIDADE_MAX_PERCENT) {
+    return "HIGH";
+  }
+  return "OK";
 }
 
-bool shouldBlinkState(const char* state) {
-  return (strcmp(state, "OK") != 0) && (strcmp(state, "CLEAR") != 0);
+const char* textoEstadoCo2(float co2Ppm) {
+  if (!isfinite(co2Ppm)) {
+    return "NA";
+  }
+  if (co2Ppm > CO2_LIMITE_ALTO_PPM) {
+    return "HIGH";
+  }
+  return "OK";
 }
 
-void setPumpOutput(PumpChannel& pump, bool on) {
-  digitalWrite(pump.pin, on ? PUMP_ON_LEVEL : PUMP_OFF_LEVEL);
-  pump.running = on;
-  if (!on) {
-    pump.stopAtMs = 0;
-  }
+bool estadoExigeAviso(const char* textoEstado) {
+ return strcmp(textoEstado, "OK") != 0 && strcmp(textoEstado, "CLEAR") != 0;
 }
 
-void allPumpsOff() {
-  for (auto& pump : g_pumps) {
-    setPumpOutput(pump, false);
-  }
-}
-
-PumpChannel* findPumpByKey(const char* key) {
-  for (auto& pump : g_pumps) {
-    if (strcmp(key, pump.key) == 0) {
-      return &pump;
-    }
-  }
-
-  if ((strcmp(key, "micronutrients") == 0) || (strcmp(key, "micronutrientes") == 0)) {
-    return &g_pumps[0];
-  }
-  if ((strcmp(key, "calcium_nitrate") == 0) || (strcmp(key, "nitrato_calcio") == 0)) {
-    return &g_pumps[1];
-  }
-  if ((strcmp(key, "potassium_nitrate") == 0) || (strcmp(key, "nitrate_potassium") == 0) || (strcmp(key, "nitrato_potassio") == 0)) {
-    return &g_pumps[2];
-  }
-  if ((strcmp(key, "magnesium_sulfate") == 0) || (strcmp(key, "sulfato_magnesio") == 0) || (strcmp(key, "sufito_magnesio") == 0)) {
-    return &g_pumps[3];
-  }
-
-  return nullptr;
-}
-
-void startPumpDose(PumpChannel& pump, uint32_t durationMs, uint32_t now) {
-  if (durationMs == 0) {
-    setPumpOutput(pump, false);
+void formatarValorLcd(char* destino, size_t tamanhoDestino, float valor, uint8_t casasDecimais, const char* unidade) {
+  if (!isfinite(valor)) {
+    snprintf(destino, tamanhoDestino, "--");
     return;
   }
 
-  setPumpOutput(pump, true);
-  pump.stopAtMs = now + durationMs;
-  Serial.printf("[PUMP] %s ON for %lu ms\n", pump.label, static_cast<unsigned long>(durationMs));
+  snprintf(destino, tamanhoDestino, "%.*f%s", casasDecimais, valor, unidade);
 }
 
-void updatePumps(uint32_t now) {
-  for (auto& pump : g_pumps) {
-    if (!pump.running) {
+void atualizarDadosLcd() {
+  const PerfilCrescimento& perfilAtivo = obterPerfilCrescimentoAtivo();
+  bool algumaBombaAtiva = false;
+
+  for (const auto& canalBomba : canaisBombasNutrientes) {
+    if (canalBomba.bombaLigada) {
+      algumaBombaAtiva = true;
+      break;
+    }
+  }
+
+  formatarValorLcd(HydroLcdData::valorTemperatura, sizeof(HydroLcdData::valorTemperatura), leituraDs18b20TemperaturaC, 1, "C");
+  formatarValorLcd(HydroLcdData::valorPh, sizeof(HydroLcdData::valorPh), leituraPhValor, 2, "");
+  formatarValorLcd(HydroLcdData::valorTds, sizeof(HydroLcdData::valorTds), leituraTdsValorPpm, 0, "ppm");
+  formatarValorLcd(HydroLcdData::valorTanque1, sizeof(HydroLcdData::valorTanque1), leituraTanque1Percent, 0, "%");
+  formatarValorLcd(HydroLcdData::valorTanque2, sizeof(HydroLcdData::valorTanque2), leituraTanque2Percent, 0, "%");
+  formatarValorLcd(HydroLcdData::valorTurbidez, sizeof(HydroLcdData::valorTurbidez), leituraTurbidezTensaoMv, 0, "mV");
+  formatarValorLcd(HydroLcdData::valorHumidade, sizeof(HydroLcdData::valorHumidade), leituraDht22HumidadePercent, 0, "%");
+  formatarValorLcd(HydroLcdData::valorCo2, sizeof(HydroLcdData::valorCo2), leituraCo2ValorPpm, 0, "ppm");
+
+  snprintf(HydroLcdData::valorReposicao, sizeof(HydroLcdData::valorReposicao), "%s", textoEstadoReposicao(leituraReposicaoEstado));
+  snprintf(HydroLcdData::valorFase, sizeof(HydroLcdData::valorFase), "%s", perfilAtivo.perfilNome);
+  snprintf(HydroLcdData::valorDosagem, sizeof(HydroLcdData::valorDosagem), "%s", algumaBombaAtiva ? "ATIVA" : "ESPERA");
+}
+
+// ============================================================================
+// Controlo das bombas de nutrientes
+// ============================================================================
+
+void atualizarBombaSaida(CanalBombaNutriente& canalBomba, bool ligarBomba) {
+  digitalWrite(canalBomba.bombaPino, ligarBomba ? BOMBA_NIVEL_LIGADA : BOMBA_NIVEL_DESLIGADA);
+  canalBomba.bombaLigada = ligarBomba;
+  if (!ligarBomba) {
+    canalBomba.bombaMomentoDesligarMs = 0;
+  }
+}
+
+void desligarTodasBombasNutrientes() {
+  for (auto& canalBomba : canaisBombasNutrientes) {
+    atualizarBombaSaida(canalBomba, false);
+  }
+}
+
+bool existeBombaNutrienteLigada() {
+  for (const auto& canalBomba : canaisBombasNutrientes) {
+    if (canalBomba.bombaLigada) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void iniciarBombaPorTempoMs(CanalBombaNutriente& canalBomba, uint32_t tempoLigadaMs, uint32_t momentoAtualMs) {
+  if (tempoLigadaMs == 0) {
+    return;
+  }
+  atualizarBombaSaida(canalBomba, true);
+  canalBomba.bombaMomentoDesligarMs = momentoAtualMs + tempoLigadaMs;
+}
+
+void iniciarBombaPorVolumeMl(CanalBombaNutriente& canalBomba, float volumeMl, uint32_t momentoAtualMs) {
+  if (volumeMl <= 0.0f || canalBomba.bombaMlPorSegundo <= 0.0f) {
+    return;
+  }
+  const uint32_t tempoLigadaMs = static_cast<uint32_t>((volumeMl / canalBomba.bombaMlPorSegundo) * 1000.0f);
+  iniciarBombaPorTempoMs(canalBomba, tempoLigadaMs, momentoAtualMs);
+}
+
+void atualizarBombasNutrientes(uint32_t momentoAtualMs) {
+  for (auto& canalBomba : canaisBombasNutrientes) {
+    if (!canalBomba.bombaLigada) {
       continue;
     }
-    if (static_cast<int32_t>(now - pump.stopAtMs) >= 0) {
-      setPumpOutput(pump, false);
-      Serial.printf("[PUMP] %s OFF\n", pump.label);
+    if (static_cast<int32_t>(momentoAtualMs - canalBomba.bombaMomentoDesligarMs) >= 0) {
+      atualizarBombaSaida(canalBomba, false);
     }
   }
 }
 
-void printPumpStatus() {
-  for (const auto& pump : g_pumps) {
-    Serial.printf("[PUMP] %s=%s\n", pump.label, pump.running ? "ON" : "OFF");
+bool nutrientesEmCooldown(uint32_t momentoAtualMs) {
+  if (nutrientesUltimaDosagemMs == 0) {
+    return false;
   }
+  return momentoAtualMs - nutrientesUltimaDosagemMs < NUTRIENTES_COOLDOWN_DOSAGEM_MS;
 }
 
-void handleCommand(char* command, uint32_t now) {
-  if (strcmp(command, "status") == 0) {
-    printPumpStatus();
+bool nutrientesEmMistura(uint32_t momentoAtualMs) {
+  return momentoAtualMs < nutrientesMisturaAteMs;
+}
+
+bool perfilPermiteDosagem(const PerfilCrescimento& perfilAtivo, uint32_t momentoAtualMs) {
+  if (!isfinite(leituraPhValor) || !isfinite(leituraTdsValorPpm)) {
+    return false;
+  }
+  if (leituraTdsValorPpm <= 0.0f) {
+    return false;
+  }
+  if (leituraPhValor < perfilAtivo.perfilPhMinimo || leituraPhValor > perfilAtivo.perfilPhMaximo) {
+    return false;
+  }
+  if (existeBombaNutrienteLigada()) {
+    return false;
+  }
+  if (nutrientesEmCooldown(momentoAtualMs) || nutrientesEmMistura(momentoAtualMs)) {
+    return false;
+  }
+  return leituraTdsValorPpm < perfilAtivo.perfilTdsAcionamentoPpm;
+}
+
+void iniciarDosagemAutomatica(const PerfilCrescimento& perfilAtivo, uint32_t momentoAtualMs) {
+  const float tdsDeficitPpm = perfilAtivo.perfilTdsAlvoPpm - leituraTdsValorPpm;
+  const float fatorCorrecao = constrain(tdsDeficitPpm / 100.0f, 0.6f, 2.0f);
+
+  iniciarBombaPorVolumeMl(canaisBombasNutrientes[0], perfilAtivo.perfilDoseMicronutrientesMl * fatorCorrecao, momentoAtualMs);
+  iniciarBombaPorVolumeMl(canaisBombasNutrientes[1], perfilAtivo.perfilDoseNitratoCalcioMl * fatorCorrecao, momentoAtualMs);
+  iniciarBombaPorVolumeMl(canaisBombasNutrientes[2], perfilAtivo.perfilDoseNitratoPotassioMl * fatorCorrecao, momentoAtualMs);
+  iniciarBombaPorVolumeMl(canaisBombasNutrientes[3], perfilAtivo.perfilDoseSulfatoMagnesioMl * fatorCorrecao, momentoAtualMs);
+
+  nutrientesUltimaDosagemMs = momentoAtualMs;
+  nutrientesMisturaAteMs = momentoAtualMs + NUTRIENTES_TEMPO_MISTURA_MS;
+}
+
+void atualizarDosagemAutomatica(uint32_t momentoAtualMs) {
+  const PerfilCrescimento& perfilAtivo = obterPerfilCrescimentoAtivo();
+  if (!perfilPermiteDosagem(perfilAtivo, momentoAtualMs)) {
     return;
   }
-
-  if (strcmp(command, "alloff") == 0) {
-    allPumpsOff();
-    Serial.println("[PUMP] All pumps OFF");
-    return;
-  }
-
-  char action[16] = {0};
-  char target[24] = {0};
-  unsigned long durationMs = 0;
-
-  const int tokens = sscanf(command, "%15s %23s %lu", action, target, &durationMs);
-  if ((tokens == 3) && (strcmp(action, "dose") == 0)) {
-    PumpChannel* pump = findPumpByKey(target);
-    if (pump == nullptr) {
-      Serial.printf("[CMD] Unknown pump: %s\n", target);
-      return;
-    }
-    startPumpDose(*pump, static_cast<uint32_t>(durationMs), now);
-    return;
-  }
-
-  Serial.println("[CMD] Use: dose <pump> <ms> | alloff | status");
+  iniciarDosagemAutomatica(perfilAtivo, momentoAtualMs);
 }
 
-void handleSerialCommands(uint32_t now) {
-  while (Serial.available() > 0) {
-    const char ch = static_cast<char>(Serial.read());
-    if ((ch == '\r') || (ch == '\n')) {
-      if (g_serialBufferLen == 0) {
-        continue;
-      }
-      g_serialBuffer[g_serialBufferLen] = '\0';
-      handleCommand(g_serialBuffer, now);
-      g_serialBufferLen = 0;
-      g_serialBuffer[0] = '\0';
-      continue;
-    }
-
-    if (g_serialBufferLen < (SERIAL_BUFFER_SIZE - 1)) {
-      g_serialBuffer[g_serialBufferLen++] = ch;
-    }
-  }
+void imprimirEstadoSerial() {
+  const PerfilCrescimento& perfilAtivo = obterPerfilCrescimentoAtivo();
+  Serial.printf(
+      "Fase=%s Temp=%.1fC pH=%.2f TDS=%.0fppm bruto=%.0f EC=%.0fuS T1=%.0f%% T2=%.0f%% Repo=%s Turb=%.0fmV adc=%d Hum=%.0f%% CO2=%.0fppm Dose=%s\n",
+      perfilAtivo.perfilNome,
+      leituraDs18b20TemperaturaC,
+      leituraPhValor,
+      leituraTdsValorPpm,
+      leituraTdsValorBrutoPpm,
+      leituraTdsEcUsCm,
+      leituraTanque1Percent,
+      leituraTanque2Percent,
+      textoEstadoReposicao(leituraReposicaoEstado),
+      leituraTurbidezTensaoMv,
+      leituraTurbidezAdc,
+      leituraDht22HumidadePercent,
+      leituraCo2ValorPpm,
+      existeBombaNutrienteLigada() ? "ON" : "WAIT");
 }
 
-void drawMetricLine(int16_t y, const char* label, float value, uint8_t decimals, const char* unit, const char* state, bool blinkOn) {
-  display.setCursor(0, y);
-  display.print(label);
-  if (isfinite(value)) {
-    display.print(value, decimals);
-  } else {
-    display.print("--");
-  }
-  display.print(unit);
-
-  if (shouldBlinkState(state) && blinkOn) {
-    display.print(" ");
-    display.print(state);
-  }
-}
-
-void drawWaterLine(int16_t y, int percentage, const char* state, bool blinkOn) {
-  display.setCursor(0, y);
-  display.print("Water:");
-  if (percentage >= 0) {
-    display.print(percentage);
-    display.print("%");
-  } else {
-    display.print("--");
-  }
-
-  if (isWarnState(state) && blinkOn) {
-    display.print(" ");
-    display.print(state);
-  }
-}
-
-void drawTextLine(int16_t y, const char* text, bool warn, bool blinkOn) {
-  display.setCursor(0, y);
-  display.print(text);
-  if (warn && blinkOn) {
-    display.print(" !");
-  }
-}
-
-void drawDashboard(bool blinkOn) {
-  if (!g_displayReady) {
-    return;
-  }
-
-  const char* tState = rangeState(g_temperatureC, TEMP_LOW_C, TEMP_HIGH_C);
-  const char* pState = rangeState(g_ph, PH_LOW, PH_HIGH);
-  const char* tdsState = rangeState(g_tdsPpm, TDS_LOW, TDS_HIGH);
-  const char* wState = waterState(g_waterPercent);
-  const char* turbState = turbidityState(g_turbidityMv);
-  const bool pageTwo = ((millis() / 4000u) % 2u) != 0u;
-
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-
-  if (!pageTwo) {
-    drawMetricLine(0, "Temp:", g_temperatureC, 1, "C", tState, blinkOn);
-    drawMetricLine(16, "pH:", g_ph, 2, "", pState, blinkOn);
-    drawMetricLine(32, "TDS:", g_tdsPpm, 0, "ppm", tdsState, blinkOn);
-    drawWaterLine(48, g_waterPercent, wState, blinkOn);
-  } else {
-    char line[32];
-    drawMetricLine(0, "Turb:", g_turbidityMv, 0, "mV", turbState, blinkOn);
-
-    snprintf(line, sizeof(line), "WS03:%s", ws03StateText(g_ws03State));
-    drawTextLine(16, line, g_ws03State == Ws03State::LiquidDetected, blinkOn);
-
-    snprintf(line, sizeof(line), "M:%s C:%s", g_pumps[0].running ? "ON" : "OFF", g_pumps[1].running ? "ON" : "OFF");
-    drawTextLine(32, line, g_pumps[0].running || g_pumps[1].running, blinkOn);
-
-    snprintf(line, sizeof(line), "P:%s Mg:%s", g_pumps[2].running ? "ON" : "OFF", g_pumps[3].running ? "ON" : "OFF");
-    drawTextLine(48, line, g_pumps[2].running || g_pumps[3].running, blinkOn);
-  }
-
-  display.display();
-}
-
-void scanI2CBus() {
-  Serial.println("[INFO] Scanning I2C bus...");
-  int found = 0;
-
-  for (uint8_t addr = 1; addr < 127; addr++) {
-    Wire.beginTransmission(addr);
-    const uint8_t error = Wire.endTransmission();
-    if (error == 0) {
-      Serial.print("[I2C] Device at 0x");
-      if (addr < 16) {
-        Serial.print('0');
-      }
-      Serial.println(addr, HEX);
-      found++;
-    }
-  }
-
-  if (found == 0) {
-    Serial.println("[WARN] No I2C devices found.");
-  }
-}
-
-void printSerialStatus() {
-  Serial.printf("Temp=%.1fC, pH=%.2f, TDS=%.0fppm, Turb=%.0fmV(%s), Water=%d%%, Zone=%s, WS03=%s, Tank1=%s, Tank2=%s, Micro=%s, CaNO3=%s, KNO3=%s, MgSO4=%s\n",
-                g_temperatureC,
-                g_ph,
-                g_tdsPpm,
-                g_turbidityMv,
-                turbidityState(g_turbidityMv),
-                g_waterPercent,
-                tankZoneText(g_waterPercent),
-                ws03StateText(g_ws03State),
-                detectorStateText(g_tank1State),
-                detectorStateText(g_tank2State),
-                g_pumps[0].running ? "ON" : "OFF",
-                g_pumps[1].running ? "ON" : "OFF",
-                g_pumps[2].running ? "ON" : "OFF",
-                g_pumps[3].running ? "ON" : "OFF");
-}
 }  // namespace
 
 void setup() {
   Serial.begin(115200);
   delay(200);
 
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  // Barramento I2C principal: LCD, RTC e sensor do tanque 1.
+  Wire.begin(PINO_TANQUE1_SDA, PINO_TANQUE1_SCL);
   Wire.setClock(100000);
 
+  // Segundo barramento I2C dedicado ao tanque principal 2.
+  barramentoI2cTanque2.begin(PINO_TANQUE2_SDA, PINO_TANQUE2_SCL, 100000);
+
+  // Configuracao dos canais ADC.
   analogReadResolution(12);
-  analogSetPinAttenuation(PH_PIN, ADC_11db);
-  analogSetPinAttenuation(TDS_PIN, ADC_11db);
-  analogSetPinAttenuation(TURBIDITY_PIN, ADC_11db);
-
-  EEPROM.begin(64);
-
-  ds18b20.begin();
-  ds18b20.setWaitForConversion(false);
-  ds18b20.requestTemperatures();
-  g_lastDsRequestMs = millis();
-  g_dsRequested = true;
-
-  ph.begin();
-
-  tds.setPin(TDS_PIN);
-  tds.setAref(3.3f);
-  tds.setAdcRange(4096.0f);
-  tds.begin();
-
-  if (TANK_1_DETECT_PIN >= 0) {
-    pinMode(TANK_1_DETECT_PIN, INPUT_PULLUP);
-  }
-  if (TANK_2_DETECT_PIN >= 0) {
-    pinMode(TANK_2_DETECT_PIN, INPUT_PULLUP);
-  }
-  if (WS03_PIN >= 0) {
-    pinMode(WS03_PIN, INPUT_PULLUP);
+  analogSetPinAttenuation(PINO_PH_ANALOGICO, ADC_11db);
+  analogSetPinAttenuation(PINO_TDS_ANALOGICO, ADC_11db);
+  analogSetPinAttenuation(PINO_TURBIDEZ_ANALOGICO, ADC_11db);
+  if (SENSOR_CO2_ATIVO) {
+    analogSetPinAttenuation(PINO_CO2_ANALOGICO, ADC_11db);
   }
 
-  for (auto& pump : g_pumps) {
-    pinMode(pump.pin, OUTPUT);
+  EEPROM.begin(EEPROM_TAMANHO_BYTES);
+  carregarConfiguracaoSistema();
+
+  sensorDs18b20.begin();
+  sensorDs18b20.setWaitForConversion(false);
+  sensorDs18b20.requestTemperatures();
+  ds18b20UltimoPedidoMs = millis();
+  ds18b20ConversaoPendente = true;
+
+  sensorPh.begin();
+
+  sensorTds.setPin(PINO_TDS_ANALOGICO);
+  sensorTds.setAref(3.3f);
+  sensorTds.setAdcRange(4096.0f);
+  sensorTds.begin();
+
+  if (SENSOR_DHT22_ATIVO) {
+    sensorDht22.begin();
   }
-  allPumpsOff();
 
-  scanI2CBus();
+  pinMode(PINO_REPOSICAO_SENSOR_LIMITE, INPUT_PULLUP);
 
-  g_displayReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR);
-  if (!g_displayReady) {
-    Serial.println("[WARN] SSD1306 initialization failed.");
-  } else {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println("Hydroponics monitor");
-    display.println("Initializing...");
-    display.display();
+  for (auto& canalBomba : canaisBombasNutrientes) {
+    pinMode(canalBomba.bombaPino, OUTPUT);
   }
+  desligarTodasBombasNutrientes();
 
-  Serial.println("[INFO] Hydroponics dashboard started.");
-  Serial.printf("[INFO] Tank 1 water mark: %d%%\n", TANK_1_MARK_PERCENT);
-  Serial.printf("[INFO] Tank 2 water mark: %d%%\n", TANK_2_MARK_PERCENT);
-  Serial.println("[INFO] Pump commands: dose <pump> <ms> | alloff | status");
-  Serial.println("[INFO] Pumps: micro, calcium, potassium, magnesium");
+  atualizarDadosLcd();
+
+  Garden::initialize();
+
+  Serial.println("[INFO] Sistema hidroponico iniciado.");
 }
 
 void loop() {
-  const uint32_t now = millis();
+  const uint32_t sistemaMomentoAtualMs = millis();
 
-  handleSerialCommands(now);
-  updatePumps(now);
+  atualizarBombasNutrientes(sistemaMomentoAtualMs);
 
-  if (g_dsRequested && (now - g_lastDsRequestMs >= DS18B20_CONVERSION_MS)) {
-    g_temperatureC = readTemperature();
-    g_dsRequested = false;
+  if (ds18b20ConversaoPendente && (sistemaMomentoAtualMs - ds18b20UltimoPedidoMs >= DS18B20_TEMPO_CONVERSAO_MS)) {
+    leituraDs18b20TemperaturaC = lerDs18b20TemperaturaC();
+    ds18b20ConversaoPendente = false;
   }
 
-  if (now - g_lastSensorTickMs >= SENSOR_INTERVAL_MS) {
-    g_lastSensorTickMs = now;
+  if (sistemaMomentoAtualMs - sistemaUltimoCicloSensoresMs >= SISTEMA_INTERVALO_LEITURA_MS) {
+    sistemaUltimoCicloSensoresMs = sistemaMomentoAtualMs;
 
-    if (!g_dsRequested) {
-      ds18b20.requestTemperatures();
-      g_lastDsRequestMs = now;
-      g_dsRequested = true;
+    if (!ds18b20ConversaoPendente) {
+      sensorDs18b20.requestTemperatures();
+      ds18b20UltimoPedidoMs = sistemaMomentoAtualMs;
+      ds18b20ConversaoPendente = true;
     }
 
-    g_ph = readPH();
-    g_tdsPpm = readTDS(g_temperatureC);
-    g_turbidityMv = readTurbidityMv();
-    g_waterPercent = readWaterLevelPercentage();
-    g_ws03State = readWs03(WS03_PIN);
-    g_tank1State = readDetector(TANK_1_DETECT_PIN);
-    g_tank2State = readDetector(TANK_2_DETECT_PIN);
-    printSerialStatus();
+    leituraPhValor = lerPhValor();
+    leituraTdsValorPpm = lerTdsValorPpm(leituraDs18b20TemperaturaC);
+    leituraTurbidezTensaoMv = lerTurbidezTensaoMv();
+    leituraDht22HumidadePercent = lerDht22HumidadePercent();
+    leituraCo2ValorPpm = lerCo2Ppm();
+
+    leituraTanque1NivelCm = lerTanquePrincipalNivelCm(Wire);
+    leituraTanque2NivelCm = lerTanquePrincipalNivelCm(barramentoI2cTanque2);
+    leituraTanque1Percent = converterTanqueNivelParaPercent(leituraTanque1NivelCm, TANQUE1_ALTURA_TOTAL_CM);
+    leituraTanque2Percent = converterTanqueNivelParaPercent(leituraTanque2NivelCm, TANQUE2_ALTURA_TOTAL_CM);
+    leituraReposicaoEstado = lerReposicaoEstado();
+
+    atualizarDosagemAutomatica(sistemaMomentoAtualMs);
+    atualizarDadosLcd();
+    imprimirEstadoSerial();
   }
 
-  const bool blinkOn = ((now / 1000u) % 2u) == 0u;
-  drawDashboard(blinkOn);
+  Garden::update();
 }

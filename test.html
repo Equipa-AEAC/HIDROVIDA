@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DJT Fighter Enterprise</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; background-color: #0d0d0d; color: white; overflow-x: hidden; }
+        .glass { background: rgba(255, 255, 255, 0.03); backdrop-filter: blur(15px); border: 1px solid rgba(255,255,255,0.08); }
+        .red-glow { box-shadow: 0 0 25px rgba(220, 38, 38, 0.4); }
+        .bottom-nav { position: fixed; bottom: 0; width: 100%; height: 75px; display: flex; justify-content: space-around; align-items: center; z-index: 50; padding-bottom: 10px; }
+        .splash-screen { position: fixed; inset: 0; background: #000; z-index: 100; display: flex; flex-direction: column; align-items: center; justify-content: center; transition: opacity 0.8s ease-out; }
+        .octagon-logo { width: 150px; height: 150px; background: url('https://i.ibb.co/Ldq0rM0/image-2e66a3.jpg') no-repeat center; background-size: 200%; border-radius: 20px; filter: drop-shadow(0 0 15px #ff0000); }
+        .view { display: none; padding-bottom: 100px; }
+        .active-view { display: block; }
+        .nav-item.active { color: #dc2626; }
+        ::-webkit-scrollbar { width: 0px; }
+    </style>
+</head>
+<body>
+
+    <!-- Splash Screen -->
+    <div id="splash" class="splash-screen">
+        <div class="octagon-logo mb-6"></div>
+        <h1 class="text-2xl font-bold tracking-widest text-white">DJT ENTERPRISE</h1>
+        <p class="text-gray-400 text-sm mt-2 uppercase">Global Martial Arts Network</p>
+        <div class="mt-10 animate-pulse text-red-600">PREPARANDO O OCTÓGONO...</div>
+    </div>
+
+    <!-- Interface Principal -->
+    <div id="app" class="hidden">
+        
+        <!-- Barra Superior Fixa -->
+        <header class="p-4 flex justify-between items-center glass sticky top-0 z-40">
+            <div class="flex items-center gap-2">
+                <div class="w-10 h-10 rounded bg-black flex items-center justify-center border border-red-600">
+                    <span class="text-xs font-bold text-red-600">DJT</span>
+                </div>
+                <span class="font-bold text-lg tracking-tighter" id="view-title">HOME</span>
+            </div>
+            <div class="flex gap-4">
+                <i class="fa-solid fa-earth-americas text-xl text-blue-400"></i>
+                <i class="fa-solid fa-bell text-xl"></i>
+            </div>
+        </header>
+
+        <!-- ABA 1: PERFIL (Lutador) -->
+        <main id="view-profile" class="view active-view animate-fade-in">
+            <!-- Foto de Capa -->
+            <div class="w-full h-40 bg-cover bg-center relative" style="background-image: url('https://images.unsplash.com/photo-1595078475328-1ab05d0a6a0e?q=80&w=1000');">
+                <div class="absolute inset-0 bg-gradient-to-t from-black to-transparent"></div>
+            </div>
+
+            <!-- Header do Perfil -->
+            <div class="px-6 -mt-12 relative flex flex-col items-center">
+                <div class="relative">
+                    <img src="https://images.unsplash.com/photo-1555597673-b21d5c935865?q=80&w=600&fit=crop" class="w-28 h-28 rounded-full border-4 border-red-600 red-glow object-cover" alt="Lutador">
+                    <div class="absolute bottom-1 right-1 w-6 h-6 bg-green-500 rounded-full border-2 border-black"></div>
+                </div>
+                <h2 class="text-2xl font-bold mt-2 uppercase tracking-tight">Alex 'Titan' Silva</h2>
+                <p class="text-red-600 font-semibold text-sm">PRO MMA FIGHTER • <span class="text-white">BRASIL</span></p>
+                <div class="flex gap-2 mt-4 w-full justify-center">
+                    <button class="bg-red-600 px-8 py-2 rounded-full font-bold hover:bg-red-700 flex-1 max-w-[150px]">Seguir</button>
+                    <button class="glass px-4 py-2 rounded-full"><i class="fa-solid fa-message"></i></button>
+                    <button class="glass px-4 py-2 rounded-full"><i class="fa-solid fa-handshake"></i></button>
+                </div>
+            </div>
+
+            <!-- Cartel -->
+            <div class="grid grid-cols-3 gap-4 p-6 mt-2">
+                <div class="glass p-3 rounded-xl text-center border-b-2 border-green-500">
+                    <p class="text-xl font-bold">18</p>
+                    <p class="text-[10px] text-gray-400 uppercase">Vitórias</p>
+                </div>
+                <div class="glass p-3 rounded-xl text-center border-b-2 border-red-500">
+                    <p class="text-xl font-bold">2</p>
+                    <p class="text-[10px] text-gray-400 uppercase">Derrotas</p>
+                </div>
+                <div class="glass p-3 rounded-xl text-center border-b-2 border-blue-500">
+                    <p class="text-xl font-bold">12</p>
+                    <p class="text-[10px] text-gray-400 uppercase">KO/SUB</p>
+                </div>
+            </div>
+
+            <!-- Galeria -->
+            <div class="px-6 mt-4">
+                <h3 class="text-xs font-bold text-gray-500 uppercase mb-3">Highlights recentes</h3>
+                <div class="flex gap-2 overflow-x-auto pb-2">
+                    <div class="min-w-[120px] h-40 rounded-lg bg-gray-900 overflow-hidden relative">
+                        <img src="https://images.unsplash.com/photo-1599058917233-57c0e880c0bb?w=400" class="h-full w-full object-cover opacity-80">
+                        <i class="fa-solid fa-play absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-2xl"></i>
+                    </div>
+                    <div class="min-w-[120px] h-40 rounded-lg bg-gray-900 overflow-hidden">
+                        <img src="https://images.unsplash.com/photo-1594381898411-846e7d193883?w=400" class="h-full w-full object-cover">
+                    </div>
+                    <div class="min-w-[120px] h-40 rounded-lg bg-gray-900 overflow-hidden">
+                        <img src="https://images.unsplash.com/photo-1544117518-2b041580c793?w=400" class="h-full w-full object-cover">
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <!-- ABA 2: ACADEMIAS (Anúncios/Treinos) -->
+        <main id="view-gyms" class="view px-6 pt-4 animate-fade-in">
+            <h3 class="text-xl font-bold mb-4">Academias & Treinos</h3>
+            
+            <!-- Card de Academia 1 -->
+            <div class="glass rounded-2xl overflow-hidden mb-6">
+                <img src="https://images.unsplash.com/photo-1534438327276-14e5300c3a48?q=80&w=800" class="w-full h-40 object-cover" alt="Gym">
+                <div class="p-4">
+                    <div class="flex justify-between items-start">
+                        <div>
+                            <h4 class="font-bold text-lg">Evolution MMA Center</h4>
+                            <p class="text-sm text-gray-400">📍 Las Vegas, USA</p>
+                        </div>
+                        <span class="bg-red-600 text-[10px] font-bold px-2 py-1 rounded">PREMIUM</span>
+                    </div>
+                    <div class="mt-4 space-y-2">
+                        <div class="flex items-center gap-2 text-sm text-gray-300">
+                            <i class="fa-solid fa-clock text-red-600"></i>
+                            <span>Treino Aberto: 18:00 - Muay Thai</span>
+                        </div>
+                        <div class="flex items-center gap-2 text-sm text-gray-300">
+                            <i class="fa-solid fa-trophy text-yellow-500"></i>
+                            <span>3x Campeão Estadual de Wrestling</span>
+                        </div>
+                    </div>
+                    <button class="w-full mt-4 bg-white text-black font-bold py-2 rounded-lg text-sm">VER HORÁRIOS COMPLETOS</button>
+                </div>
+            </div>
+
+            <!-- Card de Academia 2 -->
+            <div class="glass rounded-2xl overflow-hidden mb-6">
+                <img src="https://images.unsplash.com/photo-1552072805-2a9039d00e57?q=80&w=800" class="w-full h-40 object-cover" alt="Gym">
+                <div class="p-4">
+                    <h4 class="font-bold text-lg">Samurai Dojo Jitsu</h4>
+                    <p class="text-sm text-gray-400">📍 Tóquio, Japão</p>
+                    <p class="mt-2 text-sm text-gray-400 italic">"Onde a tradição encontra a força."</p>
+                    <button class="w-full mt-4 border border-white/20 font-bold py-2 rounded-lg text-sm">ENVIAR MENSAGEM</button>
+                </div>
+            </div>
+        </main>
+
+        <!-- ABA 3: COMPETIÇÕES (Torneios) -->
+        <main id="view-events" class="view px-6 pt-4 animate-fade-in">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-xl font-bold">Próximos Torneios</h3>
+                <i class="fa-solid fa-sliders text-red-600"></i>
+            </div>
+
+            <!-- Evento 1 -->
+            <div class="bg-gradient-to-r from-red-900/40 to-black border border-red-600/30 rounded-2xl p-5 mb-4 relative overflow-hidden">
+                <div class="absolute right-[-20px] top-[-10px] opacity-10">
+                    <i class="fa-solid fa-hand-fist text-8xl rotate-12"></i>
+                </div>
+                <div class="flex justify-between items-center mb-3">
+                    <span class="text-xs font-bold text-red-500 uppercase tracking-widest">Mundial de BJJ</span>
+                    <span class="bg-red-600 px-2 py-0.5 rounded text-[10px] font-bold">LIVE ON DJT</span>
+                </div>
+                <h4 class="text-xl font-bold mb-1">WORLD GRAPPLING CUP 2026</h4>
+                <p class="text-sm text-gray-400 mb-4"><i class="fa-solid fa-calendar mr-2"></i>Março 15-20 | Abu Dhabi</p>
+                <div class="flex justify-between items-center border-t border-white/10 pt-4">
+                    <div class="text-xs">
+                        <p class="text-gray-500 uppercase">Inscrições</p>
+                        <p class="text-green-500 font-bold uppercase">Abertas</p>
+                    </div>
+                    <button class="bg-white text-black px-4 py-2 rounded-lg text-xs font-bold">INSCREVER-SE</button>
+                </div>
+            </div>
+
+            <!-- Evento 2 -->
+            <div class="glass rounded-2xl p-5 mb-4">
+                <div class="flex justify-between items-center mb-3">
+                    <span class="text-xs font-bold text-gray-500 uppercase tracking-widest">Muay Thai Open</span>
+                </div>
+                <h4 class="text-lg font-bold mb-1">Bangkok Strike Night</h4>
+                <p class="text-sm text-gray-400 mb-4"><i class="fa-solid fa-location-dot mr-2"></i>Rajadamnern Stadium</p>
+                <button class="w-full border border-red-600 text-red-600 font-bold py-2 rounded-lg text-xs">VER DETALHES DO CARD</button>
+            </div>
+        </main>
+
+        <!-- Barra de Navegação Inferior -->
+        <nav class="bottom-nav glass border-t border-white/10">
+            <button onclick="switchView('profile', 'PERFIL')" class="nav-item active flex flex-col items-center" id="nav-profile">
+                <i class="fa-solid fa-user text-xl"></i>
+                <span class="text-[10px] mt-1 uppercase font-bold">Perfil</span>
+            </button>
+            <button onclick="switchView('gyms', 'ACADEMIAS')" class="nav-item flex flex-col items-center text-gray-500" id="nav-gyms">
+                <i class="fa-solid fa-house-chimney text-xl"></i>
+                <span class="text-[10px] mt-1 uppercase font-bold">Academias</span>
+            </button>
+            <button class="flex flex-col items-center">
+                <div class="w-12 h-12 bg-red-600 rounded-full flex items-center justify-center text-white -mt-10 border-4 border-[#0d0d0d] shadow-lg shadow-red-600/20">
+                    <i class="fa-solid fa-plus text-xl"></i>
+                </div>
+            </button>
+            <button onclick="switchView('events', 'EVENTOS')" class="nav-item flex flex-col items-center text-gray-500" id="nav-events">
+                <i class="fa-solid fa-trophy text-xl"></i>
+                <span class="text-[10px] mt-1 uppercase font-bold">Torneios</span>
+            </button>
+            <button class="nav-item flex flex-col items-center text-gray-500">
+                <i class="fa-solid fa-magnifying-glass text-xl"></i>
+                <span class="text-[10px] mt-1 uppercase font-bold">Busca</span>
+            </button>
+        </nav>
+
+    </div>
+
+    <script>
+        // Lógica de Splash Screen
+        window.addEventListener('load', () => {
+            setTimeout(() => {
+                const splash = document.getElementById('splash');
+                const app = document.getElementById('app');
+                splash.style.opacity = '0';
+                setTimeout(() => {
+                    splash.style.display = 'none';
+                    app.classList.remove('hidden');
+                }, 800);
+            }, 2500);
+        });
+
+        // Lógica de Troca de Telas (Views)
+        function switchView(viewId, title) {
+            // Esconder todas as views
+            document.querySelectorAll('.view').forEach(v => v.classList.remove('active-view'));
+            // Remover estado ativo da nav
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active', 'text-red-600'));
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.add('text-gray-500'));
+
+            // Mostrar a view selecionada
+            document.getElementById('view-' + viewId).classList.add('active-view');
+            // Ativar item na nav
+            const activeNav = document.getElementById('nav-' + viewId);
+            activeNav.classList.add('active', 'text-red-600');
+            activeNav.classList.remove('text-gray-500');
+            
+            // Atualizar Título
+            document.getElementById('view-title').innerText = title;
+
+            // Scroll para o topo
+            window.scrollTo(0, 0);
+        }
+    </script>
+</body>
+</html>

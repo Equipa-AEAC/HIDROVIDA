@@ -1,597 +1,826 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <SPI.h>
-#include <SD.h>
-#include <RTClib.h> 
-#include <waterlevelsensor.h>
+#include <EEPROM.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <DFRobot_ESP_PH.h>
+#ifdef ReceivedBufferLength
+#undef ReceivedBufferLength
+#endif
+#include <GravityTDS.h>
+#include <DHT.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <cstdio>
+#include <cstring>
 
-// ============================================================
-//  Hardware Pin Configuration
-// ============================================================
-// I2C Pins (DS3231 RTC + Water Level Sensor)
-constexpr uint8_t PIN_SDA = 21;
-constexpr uint8_t PIN_SCL = 22;
+namespace {
 
-// SPI Pins (MicroSD Card Reader)
-constexpr uint8_t PIN_SD_CS   = 14;
-constexpr uint8_t PIN_SD_MOSI = 26;
-constexpr uint8_t PIN_SD_SCK  = 27;
-constexpr uint8_t PIN_SD_MISO = 25;
+// ============================================================================
+// Configuracao de hardware
+// ============================================================================
 
-// Output Pins (Relays/Mosfets)
-constexpr uint8_t PIN_CIRCULATION_PUMP = 5;
-constexpr uint8_t PIN_REFILL_PUMP      = 17;
-constexpr uint8_t PIN_ONBOARD_LED      = 2; // ESP32 DevKit built-in LED
+constexpr uint8_t PINO_DS18B20_DADOS = 3;
+constexpr uint8_t PINO_PH_ANALOGICO = 4;
+constexpr uint8_t PINO_TDS_ANALOGICO = 5;
+constexpr uint8_t PINO_TURBIDEZ_ANALOGICO = 6;
+constexpr uint8_t PINO_REPOSICAO_SENSOR_LIMITE = 7;
 
-// OneWire Pin (DS18B20 Temperature)
-constexpr uint8_t PIN_TEMP_BUS = 33;
+constexpr uint8_t PINO_TANQUE1_SDA = 8;
+constexpr uint8_t PINO_TANQUE1_SCL = 9;
 
-// ============================================================
-//  Settings
-// ============================================================
-constexpr int WATER_LEVEL_MIN_THRESHOLD = 20;
-constexpr int WATER_LEVEL_MAX_THRESHOLD = 80;
+constexpr uint8_t PINO_BOMBA_MICRONUTRIENTES = 10;
+constexpr uint8_t PINO_BOMBA_NITRATO_CALCIO = 11;
+constexpr uint8_t PINO_BOMBA_NITRATO_POTASSIO = 12;
+constexpr uint8_t PINO_BOMBA_SULFATO_MAGNESIO = 13;
 
-constexpr uint8_t       CIRCULATION_HOUR        = 14;
-constexpr uint8_t       CIRCULATION_MINUTE      = 30;
-constexpr unsigned long CIRCULATION_DURATION_MS  = 300000UL;
+constexpr uint8_t PINO_TANQUE2_SDA = 15;
+constexpr uint8_t PINO_TANQUE2_SCL = 16;
 
-constexpr unsigned long MAX_REFILL_TIME_MS = 120000UL;
-constexpr unsigned long LOG_INTERVAL_MS = 30000UL;
-constexpr const char*   LOG_FILENAME    = "/hydro.csv";
+constexpr uint8_t PINO_DHT22_DADOS = 1;
+constexpr uint8_t PINO_CO2_ANALOGICO = 2;
 
-constexpr unsigned long SERIAL_BAUD_RATE        = 115200;
+constexpr bool SENSOR_DHT22_ATIVO = false;
+constexpr bool SENSOR_CO2_ATIVO = false;
+constexpr bool SENSOR_REPOSICAO_ATIVO_EM_BAIXO = true;
 
-// ============================================================
-//  Temperature Manager (Non-Blocking)
-// ============================================================
-class TemperatureManager {
-public:
-    TemperatureManager() : _oneWire(PIN_TEMP_BUS), _sensors(&_oneWire) {}
-    
-    void begin() {
-        _sensors.begin();
-        _sensors.setWaitForConversion(false); // IMPORTANT: Make it async
-        Serial.println("[TEMP] DS18B20 initialized (Async)");
-        _requestTime = millis();
-        _sensors.requestTemperatures(); // Start first conversion
-    }
+// ============================================================================
+// Configuracao de interfaces
+// ============================================================================
 
-    void update() {
-        unsigned long now = millis();
-        // Read every 2 seconds
-        if (now - _lastProcessTime < 2000) return; 
+constexpr uint16_t OLED_LARGURA = 128;
+constexpr uint16_t OLED_ALTURA = 64;
+constexpr uint8_t OLED_PINO_RESET = 255;
+constexpr uint8_t OLED_ENDERECO_I2C = 0x3C;
 
-        // Check if conversion is done (750ms for 12-bit, so 2000ms is plenty)
-        float t = _sensors.getTempCByIndex(0);
-        
-        if (t == DEVICE_DISCONNECTED_C || t < -80) {
-            _valid = false;
-        } else {
-            _tempC = t;
-            _valid = true;
-        }
+constexpr uint8_t DHT22_TIPO = DHT22;
+constexpr size_t EEPROM_TAMANHO_BYTES = 64;
 
-        // Start next conversion immediately after reading
-        _sensors.requestTemperatures();
-        _requestTime = now;
-        _lastProcessTime = now;
-    }
+// ============================================================================
+// Temporizacao do sistema
+// ============================================================================
 
-    float getCelsius() const { return _tempC; }
-    bool isValid() const { return _valid; }
+constexpr uint32_t SISTEMA_INTERVALO_LEITURA_MS = 1000;
+constexpr uint32_t DS18B20_TEMPO_CONVERSAO_MS = 750;
+constexpr uint32_t DHT22_INTERVALO_LEITURA_MS = 2500;
+constexpr uint32_t OLED_INTERVALO_PAGINA_MS = 3000;
+constexpr uint32_t NUTRIENTES_COOLDOWN_DOSAGEM_MS = 120000;
+constexpr uint32_t NUTRIENTES_TEMPO_MISTURA_MS = 45000;
 
-private:
-    OneWire _oneWire;
-    DallasTemperature _sensors;
-    float _tempC = -127.0f;
-    bool _valid = false;
-    unsigned long _requestTime = 0;
-    unsigned long _lastProcessTime = 0;
+// ============================================================================
+// Parametros ADC
+// ============================================================================
+
+constexpr uint8_t ADC_NUMERO_AMOSTRAS = 10;
+constexpr float ADC_VALOR_MAXIMO = 4095.0f;
+constexpr float ADC_REFERENCIA_MV = 3300.0f;
+constexpr float TEMPERATURA_PADRAO_C = 25.0f;
+
+// ============================================================================
+// Limites de operacao
+// ============================================================================
+
+constexpr float DS18B20_TEMPERATURA_MIN_C = 18.0f;
+constexpr float DS18B20_TEMPERATURA_MAX_C = 28.0f;
+
+constexpr float TURBIDEZ_TENSAO_LIMPA_MV = 2500.0f;
+constexpr float TURBIDEZ_TENSAO_SUJA_MV = 1500.0f;
+
+constexpr float DHT22_HUMIDADE_MIN_PERCENT = 40.0f;
+constexpr float DHT22_HUMIDADE_MAX_PERCENT = 75.0f;
+constexpr float CO2_LIMITE_ALTO_PPM = 1400.0f;
+
+constexpr float TANQUE1_ALTURA_TOTAL_CM = 10.0f;
+constexpr float TANQUE2_ALTURA_TOTAL_CM = 18.0f;
+constexpr float GROVE_NIVEL_FAIXA_SENSOR_CM = 10.0f;
+constexpr float TANQUE_PRINCIPAL_NIVEL_BAIXO_PERCENT = 20.0f;
+
+// ============================================================================
+// Enderecos I2C dos sensores Grove water level
+// ============================================================================
+
+constexpr uint8_t GROVE_NIVEL_ENDERECO_BAIXO_PRIMARIO = 0x77;
+constexpr uint8_t GROVE_NIVEL_ENDERECO_ALTO_PRIMARIO = 0x78;
+constexpr uint8_t GROVE_NIVEL_ENDERECO_BAIXO_ALTERNATIVO = 0x3B;
+constexpr uint8_t GROVE_NIVEL_ENDERECO_ALTO_ALTERNATIVO = 0x3C;
+
+// ============================================================================
+// Parametros das bombas e EEPROM
+// ============================================================================
+
+constexpr uint8_t BOMBA_NIVEL_LIGADA = LOW;
+constexpr uint8_t BOMBA_NIVEL_DESLIGADA = HIGH;
+
+constexpr uint32_t EEPROM_ASSINATURA_CONFIG = 0x4844524Fu;
+constexpr int EEPROM_ENDERECO_CONFIG = 0;
+constexpr float TDS_AJUSTE_AR_PADRAO_PPM = 40.0f;
+constexpr float TDS_MARGEM_AR_PPM = 5.0f;
+
+// ============================================================================
+// Estruturas de configuracao
+// ============================================================================
+
+struct ConfiguracaoSistema {
+  uint32_t configuracaoAssinatura;
+  float sensorTdsValorArPpm;
+  float sensorTdsLimiteArPpm;
 };
 
-// ============================================================
-//  WaterLevelManager
-// ============================================================
-enum class WaterLevelState : uint8_t {
-    LEVEL_EMPTY,
-    LEVEL_LOW,
-    LEVEL_NORMAL,
-    LEVEL_HIGH
+enum class FaseCrescimento : uint8_t {
+  Germinacao,
+  Vegetativo,
+  Floracao,
 };
 
-class WaterLevelManager {
-public:
-    void begin() {
-        // Wire.begin() is called in setup()
-        if (_sensor.begin()) {
-            Serial.println("[WATER] Grove Dual-Sensor (Low+High) detected.");
-        } else {
-            Serial.println("[WATER] WARNING: One or both sensor modules MISSING!");
-        }
-    }
-
-    void update() {
-        unsigned long now = millis();
-        if (now - _lastReadTime < 1000) return;
-        _lastReadTime = now;
-
-        // The library reads from I2C. If device missing, it might return 0 or garbage.
-        int reading = _sensor.readPercentage(); 
-        
-        // Filter garbage
-        if (reading > 100) reading = 100;
-        if (reading < 0) reading = 0;
-
-        _percentage = reading;
-
-        if (_percentage == 0) {
-            _state = WaterLevelState::LEVEL_EMPTY;
-        } else if (_percentage < WATER_LEVEL_MIN_THRESHOLD) {
-            _state = WaterLevelState::LEVEL_LOW;
-        } else if (_percentage >= WATER_LEVEL_MAX_THRESHOLD) {
-            _state = WaterLevelState::LEVEL_HIGH;
-        } else {
-            _state = WaterLevelState::LEVEL_NORMAL;
-        }
-    }
-
-    int             getPercentage() const { return _percentage; }
-    WaterLevelState getState()      const { return _state; }
-
-    const char* getStateName() const {
-        switch (_state) {
-            case WaterLevelState::LEVEL_EMPTY:  return "EMPTY";
-            case WaterLevelState::LEVEL_LOW:    return "LOW";
-            case WaterLevelState::LEVEL_NORMAL: return "NORMAL";
-            case WaterLevelState::LEVEL_HIGH:   return "HIGH";
-            default:                            return "UNKNOWN";
-        }
-    }
-
-private:
-    WaterLevelSensor _sensor;
-    int              _percentage   = 0;
-    WaterLevelState  _state        = WaterLevelState::LEVEL_EMPTY;
-    unsigned long    _lastReadTime = 0;
+enum class EstadoTanqueReposicao : uint8_t {
+  Baixo,
+  OK,
 };
 
-// ============================================================
-//  PumpController
-// ============================================================
-class PumpController {
-public:
-    PumpController(uint8_t pin, const char* name)
-        : _pin(pin), _name(name) {}
-
-    void begin() {
-        pinMode(_pin, OUTPUT);
-        digitalWrite(_pin, HIGH);  // Active LOW relays: HIGH = OFF
-        _running = false;
-        Serial.printf("[PUMP] %s initialized on GPIO%d (OFF)\n", _name, _pin);
-    }
-
-    void turnOn() {
-        if (_running) return;
-        digitalWrite(_pin, LOW);  // Active LOW
-        _running = true;
-        Serial.printf("[PUMP] %s -> ON\n", _name);
-    }
-
-    void turnOff() {
-        if (!_running) return;
-        digitalWrite(_pin, HIGH); // Active LOW
-        _running = false;
-        Serial.printf("[PUMP] %s -> OFF\n", _name);
-    }
-
-    bool isOn() const { 
-        return digitalRead(_pin) == LOW; 
-    }
-    const char* getName() const { return _name; }
-
-private:
-    uint8_t     _pin;
-    const char* _name;
-    bool        _running = false;
+struct CanalBombaNutriente {
+  uint8_t bombaPino;
+  const char* bombaNome;
+  float bombaMlPorSegundo;
+  bool bombaLigada;
+  uint32_t bombaMomentoDesligarMs;
 };
 
-// ============================================================
-//  RTCManager (DS3231)
-// ============================================================
-class RTCManager {
-public:
-    RTCManager() {}
-
-    void begin(bool forceSync = false) {
-        if (!_rtc.begin()) {
-            Serial.println("[RTC] FAILURE: DS3231 not detected on I2C!");
-            _valid = false;
-            return;
-        }
-
-        if (forceSync || _rtc.lostPower()) {
-            Serial.println("[RTC] Syncing time to compilation time...");
-            _rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-        }
-        
-        _valid = true;
-        
-        DateTime now = _rtc.now();
-        Serial.printf("[RTC] Time: %04d-%02d-%02d %02d:%02d:%02d\n", 
-            now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
-    }
-
-    void update() {
-        if (!_valid) return;
-        unsigned long now = millis();
-        if (now - _lastUpdate < 1000) return;
-        _lastUpdate = now;
-
-        DateTime dt = _rtc.now();
-        
-        _second = dt.second();
-        _minute = dt.minute();
-        _hour   = dt.hour();
-        _day    = dt.day();
-        _month  = dt.month();
-        _year   = dt.year();
-    }
-
-    uint8_t getHour()   const { return _hour; }
-    uint8_t getMinute() const { return _minute; }
-    uint8_t getSecond() const { return _second; }
-
-    void getTimestamp(char* buf, size_t len) const {
-        snprintf(buf, len, "%04u-%02u-%02u %02u:%02u:%02u",
-                 (unsigned)_year, (unsigned)_month, (unsigned)_day,
-                 (unsigned)_hour, (unsigned)_minute, (unsigned)_second);
-    }
-
-    bool isValid() const { return _valid; }
-
-private:
-    RTC_DS3231 _rtc;
-    uint8_t  _hour = 0, _minute = 0, _second = 0, _day = 0, _month = 0;
-    uint16_t _year = 0;
-    bool     _valid  = false;
-    unsigned long _lastUpdate = 0;
+struct PerfilCrescimento {
+  FaseCrescimento perfilFase;
+  const char* perfilNome;
+  float perfilTdsAlvoPpm;
+  float perfilTdsAcionamentoPpm;
+  float perfilPhMinimo;
+  float perfilPhMaximo;
+  float perfilDoseMicronutrientesMl;
+  float perfilDoseNitratoCalcioMl;
+  float perfilDoseNitratoPotassioMl;
+  float perfilDoseSulfatoMagnesioMl;
 };
 
-// ============================================================
-//  SDLogger
-// ============================================================
-class SDLogger {
-public:
-    void begin() {
-        SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
-        if (!SD.begin(PIN_SD_CS)) {
-            Serial.println("[SD] Mount Failed or No Card");
-            _ready = false;
-            return;
-        }
-        _ready = true;
-        Serial.println("[SD] Mounted successfully");
-        if (!SD.exists(LOG_FILENAME)) {
-            writeLineToFile("timestamp,level_pct,level_state,refill,circulation,temp_c");
-        }
-    }
+// ============================================================================
+// Perfil ativo do sistema
+// ============================================================================
 
-    void logData(const RTCManager& rtc,
-                 const WaterLevelManager& water,
-                 const PumpController& refillPump,
-                 const PumpController& circPump,
-                 const TemperatureManager& temp) {
-        if (!_ready) return;
-        char ts[24];
-        rtc.getTimestamp(ts, sizeof(ts));
-        
-        char tempStr[8];
-        if (temp.isValid()) dtostrf(temp.getCelsius(), 4, 1, tempStr);
-        else strcpy(tempStr, "ERR");
+constexpr FaseCrescimento PERFIL_CRESCIMENTO_ATIVO = FaseCrescimento::Vegetativo;
 
-        char line[128];
-        snprintf(line, sizeof(line), "%s,LEVEL=%d,STATE=%s,REFILL=%s,CIRC=%s,TEMP=%s",
-                 ts,
-                 water.getPercentage(),
-                 water.getStateName(),
-                 refillPump.isOn() ? "ON" : "OFF",
-                 circPump.isOn()   ? "ON" : "OFF",
-                 tempStr);
-        writeLineToFile(line);
-        Serial.printf("[SD LOG] %s\n", line);
-    }
-
-    void logEvent(const RTCManager& rtc, const char* message) {
-        if (!_ready) return;
-        char ts[24];
-        rtc.getTimestamp(ts, sizeof(ts));
-        char line[160];
-        snprintf(line, sizeof(line), "%s,EVENT,%s", ts, message);
-        writeLineToFile(line);
-        Serial.printf("[SD EVENT] %s\n", line);
-    }
-
-    bool isReady() const { return _ready; }
-
-private:
-    bool _ready = false;
-
-    void writeLineToFile(const char* line) {
-        File f = SD.open(LOG_FILENAME, FILE_APPEND);
-        if (f) {
-            f.println(line);
-            f.close();
-        } else {
-             Serial.println("[SD] Write failed");
-        }
-    }
+constexpr PerfilCrescimento PERFIS_CRESCIMENTO[] = {
+    {FaseCrescimento::Germinacao, "GERM", 450.0f, 380.0f, 5.6f, 6.2f, 0.8f, 1.0f, 0.8f, 0.6f},
+    {FaseCrescimento::Vegetativo, "VEG", 850.0f, 780.0f, 5.8f, 6.2f, 1.2f, 2.2f, 1.8f, 1.0f},
+    {FaseCrescimento::Floracao, "FLOR", 1050.0f, 950.0f, 5.8f, 6.3f, 1.0f, 1.8f, 2.6f, 1.2f},
 };
 
-// ============================================================
-//  Controllers (Logic)
-// ============================================================
-class RefillController {
-public:
-    RefillController(PumpController& pump, WaterLevelManager& waterLevel)
-        : _pump(pump), _waterLevel(waterLevel) {}
+// ============================================================================
+// Objetos de hardware
+// ============================================================================
 
-    void update() {
-        WaterLevelState state = _waterLevel.getState();
+TwoWire barramentoI2cTanque2 = TwoWire(1);
+OneWire barramentoOneWireDs18b20(PINO_DS18B20_DADOS);
+DallasTemperature sensorDs18b20(&barramentoOneWireDs18b20);
+DFRobot_ESP_PH sensorPh;
+GravityTDS sensorTds;
+DHT sensorDht22(PINO_DHT22_DADOS, DHT22_TIPO);
+Adafruit_SSD1306 displayOled(OLED_LARGURA, OLED_ALTURA, &Wire, OLED_PINO_RESET);
 
-        if (_refilling && !_pump.isOn()) _refilling = false;
+// ============================================================================
+// Estado persistente do sistema
+// ============================================================================
 
-        if (!_refilling) {
-            if (state == WaterLevelState::LEVEL_LOW) {
-                Serial.println("[AUTOPILOT] Level LOW -> START Refill");
-                _pump.turnOn();
-                _refilling = true;
-            }
-        } else {
-            if (state == WaterLevelState::LEVEL_HIGH) {
-                Serial.println("[AUTOPILOT] Level HIGH -> STOP Refill");
-                _pump.turnOff();
-                _refilling = false;
-            }
-        }
-    }
-private:
-    PumpController&    _pump;
-    WaterLevelManager& _waterLevel;
-    bool               _refilling = false;
+ConfiguracaoSistema configuracaoSistema = {
+    EEPROM_ASSINATURA_CONFIG,
+    0.0f,
+    TDS_AJUSTE_AR_PADRAO_PPM,
 };
 
-class CirculationController {
-public:
-    CirculationController(PumpController& pump, const RTCManager& rtc)
-        : _pump(pump), _rtc(rtc) {}
-
-    void begin() {
-        Serial.printf("[CIRC] Schedule: %02u:%02u Daily for %lu sec\n",
-                      CIRCULATION_HOUR, CIRCULATION_MINUTE,
-                      CIRCULATION_DURATION_MS / 1000);
-    }
-
-    void update() {
-        unsigned long now = millis();
-        if (_circulating && !_pump.isOn()) _circulating = false;
-
-        if (!_rtc.isValid()) return; // Can't schedule without time
-
-        uint8_t h = _rtc.getHour();
-        uint8_t m = _rtc.getMinute();
-
-        // Reset trigger flag once the minute has passed
-        if (_triggeredToday && m != CIRCULATION_MINUTE) {
-            _triggeredToday = false;
-        }
-
-        if (!_circulating) {
-            if (!_triggeredToday && h == CIRCULATION_HOUR && m == CIRCULATION_MINUTE) {
-                Serial.println("[CIRC] Timer matched -> START Circulation");
-                _pump.turnOn();
-                _circulating    = true;
-                _triggeredToday = true;
-                _pumpStartTime  = now;
-            }
-        } else {
-            if (now - _pumpStartTime >= CIRCULATION_DURATION_MS) {
-                Serial.println("[CIRC] Duration reached -> STOP Circulation");
-                _pump.turnOff();
-                _circulating = false;
-            }
-        }
-    }
-private:
-    PumpController&   _pump;
-    const RTCManager& _rtc;
-    bool              _circulating    = false;
-    bool              _triggeredToday = false;
-    unsigned long     _pumpStartTime  = 0;
+CanalBombaNutriente canaisBombasNutrientes[] = {
+    {PINO_BOMBA_MICRONUTRIENTES, "Micro", 1.00f, false, 0},
+    {PINO_BOMBA_NITRATO_CALCIO, "CaNO3", 1.00f, false, 0},
+    {PINO_BOMBA_NITRATO_POTASSIO, "KNO3", 1.00f, false, 0},
+    {PINO_BOMBA_SULFATO_MAGNESIO, "MgSO4", 1.00f, false, 0},
 };
 
-class SafetyManager {
-public:
-    SafetyManager(WaterLevelManager& waterLevel,
-                  PumpController&    circulationPump,
-                  PumpController&    refillPump,
-                  SDLogger&          logger,
-                  const RTCManager&  rtc)
-        : _waterLevel(waterLevel),
-          _circulationPump(circulationPump),
-          _refillPump(refillPump),
-          _logger(logger),
-          _rtc(rtc) {}
+// ============================================================================
+// Leituras atuais dos sensores
+// ============================================================================
 
-    void update() {
-        WaterLevelState state = _waterLevel.getState();
-        
-        // Overflow safety (if sensor reads > MAX while pump is OFF, maybe leak or manual fill?)
-        // Not implemented here, but we catch sensor failures.
+float leituraDs18b20TemperaturaC = NAN;
 
-        // Refill Timeout Safety
-        if (_refillPump.isOn()) {
-            if (_refillRunStart == 0) _refillRunStart = millis();
-            
-            if (millis() - _refillRunStart > MAX_REFILL_TIME_MS) {
-                Serial.println("[SAFETY] Refill Timeout! Locking pump.");
-                _logger.logEvent(_rtc, "SAFETY:REFILL_TIMEOUT_LOCK");
-                _refillPump.turnOff();
-                _refillLocked = true;
-            }
-        } else {
-            _refillRunStart = 0;
-        }
+float leituraPhValor = NAN;
+float leituraPhTensaoMv = NAN;
 
-        // Stop Refill if High Level (Redundant safety)
-        if (state == WaterLevelState::LEVEL_HIGH && _refillPump.isOn()) {
-            Serial.println("[SAFETY] High Level Intercept -> Stop Refill");
-            _refillPump.turnOff();
-        }
-    }
+float leituraTdsValorPpm = NAN;
+float leituraTdsValorBrutoPpm = NAN;
+float leituraTdsEcUsCm = NAN;
+float leituraTdsTensaoMv = NAN;
 
-    bool isEmergency()    const { return _emergencyStop; }
-    bool isRefillLocked() const { return _refillLocked; }
+float leituraTurbidezTensaoMv = NAN;
+int leituraTurbidezAdc = -1;
+int leituraTurbidezAdcMin = 4095;
+int leituraTurbidezAdcMax = 0;
 
-private:
-    WaterLevelManager& _waterLevel;
-    PumpController&    _circulationPump;
-    PumpController&    _refillPump;
-    SDLogger&          _logger;
-    const RTCManager&  _rtc;
+float leituraDht22HumidadePercent = NAN;
+float leituraCo2ValorPpm = NAN;
 
-    bool          _emergencyStop   = false;
-    bool          _refillLocked    = false;
-    unsigned long _refillRunStart  = 0;
-};
+float leituraTanque1NivelCm = NAN;
+float leituraTanque2NivelCm = NAN;
+float leituraTanque1Percent = NAN;
+float leituraTanque2Percent = NAN;
+EstadoTanqueReposicao leituraReposicaoEstado = EstadoTanqueReposicao::Baixo;
 
-// ============================================================
-//  Instances & Globals
-// ============================================================
+// ============================================================================
+// Estado de controlo temporal
+// ============================================================================
 
-WaterLevelManager   waterLevel;
-RTCManager          rtc;
-TemperatureManager  temp;
-SDLogger            sdLogger;
+uint32_t sistemaUltimoCicloSensoresMs = 0;
+uint32_t ds18b20UltimoPedidoMs = 0;
+uint32_t dht22UltimaLeituraMs = 0;
+uint32_t nutrientesUltimaDosagemMs = 0;
+uint32_t nutrientesMisturaAteMs = 0;
 
-PumpController      circulationPump(PIN_CIRCULATION_PUMP, "Circulation");
-PumpController      refillPump(PIN_REFILL_PUMP, "Refill");
+bool ds18b20ConversaoPendente = false;
+bool oledInicializado = false;
 
-RefillController       refill(refillPump, waterLevel);
-CirculationController  circulation(circulationPump, rtc);
-SafetyManager          safety(waterLevel, circulationPump, refillPump, sdLogger, rtc);
+// ============================================================================
+// Funcoes auxiliares de configuracao
+// ============================================================================
 
-// Timers
-static unsigned long lastDebugPrint = 0;
-static unsigned long lastLogTime    = 0;
-
-void i2cCheckSpecific() {
-    Serial.println("\n[I2C CHECK] Verifying specific devices...");
-    
-    // Check RTC (0x68)
-    Wire.beginTransmission(0x68);
-    if (Wire.endTransmission() == 0) Serial.println("[I2C] DS3231 RTC found at 0x68");
-    else Serial.println("[I2C] DS3231 RTC NOT FOUND at 0x68");
-
-    // Check Water Level Low (0x77)
-    Wire.beginTransmission(0x77);
-    if (Wire.endTransmission() == 0) Serial.println("[I2C] Water Level (Low) found at 0x77");
-    else Serial.println("[I2C] Water Level (Low) NOT FOUND at 0x77");
-
-    // Check Water Level High (0x78)
-    Wire.beginTransmission(0x78);
-    if (Wire.endTransmission() == 0) Serial.println("[I2C] Water Level (High) found at 0x78");
-    else Serial.println("[I2C] Water Level (High) NOT FOUND at 0x78");
-    
-    Serial.println("[I2C CHECK] Done\n");
+void guardarConfiguracaoSistema() {
+  EEPROM.put(EEPROM_ENDERECO_CONFIG, configuracaoSistema);
+  EEPROM.commit();
 }
 
+void carregarConfiguracaoSistema() {
+  EEPROM.get(EEPROM_ENDERECO_CONFIG, configuracaoSistema);
+  const bool configuracaoInvalida =
+      configuracaoSistema.configuracaoAssinatura != EEPROM_ASSINATURA_CONFIG ||
+      !isfinite(configuracaoSistema.sensorTdsLimiteArPpm) ||
+      configuracaoSistema.sensorTdsLimiteArPpm < 0.0f ||
+      configuracaoSistema.sensorTdsLimiteArPpm > 200.0f;
+
+  if (configuracaoInvalida) {
+    configuracaoSistema.configuracaoAssinatura = EEPROM_ASSINATURA_CONFIG;
+    configuracaoSistema.sensorTdsValorArPpm = 0.0f;
+    configuracaoSistema.sensorTdsLimiteArPpm = TDS_AJUSTE_AR_PADRAO_PPM;
+    guardarConfiguracaoSistema();
+  }
+}
+
+const PerfilCrescimento& obterPerfilCrescimentoAtivo() {
+  for (const auto& perfilAtual : PERFIS_CRESCIMENTO) {
+    if (perfilAtual.perfilFase == PERFIL_CRESCIMENTO_ATIVO) {
+      return perfilAtual;
+    }
+  }
+  return PERFIS_CRESCIMENTO[0];
+}
+
+// ============================================================================
+// Funcoes auxiliares ADC
+// ============================================================================
+
+float calcularMediaAdcContagens(uint8_t pinoAdc, uint8_t numeroAmostras) {
+  uint32_t somaLeituras = 0;
+  for (uint8_t indiceAmostra = 0; indiceAmostra < numeroAmostras; indiceAmostra++) {
+    somaLeituras += static_cast<uint32_t>(analogRead(pinoAdc));
+    delay(10);
+  }
+  return static_cast<float>(somaLeituras) / static_cast<float>(numeroAmostras);
+}
+
+float calcularMediaAdcMv(uint8_t pinoAdc, uint8_t numeroAmostras) {
+  const float mediaContagens = calcularMediaAdcContagens(pinoAdc, numeroAmostras);
+  return (mediaContagens / ADC_VALOR_MAXIMO) * ADC_REFERENCIA_MV;
+}
+
+// ============================================================================
+// Leituras dos sensores analogicos e digitais
+// ============================================================================
+
+float lerDs18b20TemperaturaC() {
+  const float temperaturaC = sensorDs18b20.getTempCByIndex(0);
+  if (temperaturaC == DEVICE_DISCONNECTED_C) {
+    return NAN;
+  }
+  return temperaturaC;
+}
+
+float lerPhValor() {
+  const float temperaturaCompensacao = isfinite(leituraDs18b20TemperaturaC) ? leituraDs18b20TemperaturaC : TEMPERATURA_PADRAO_C;
+  leituraPhTensaoMv = calcularMediaAdcMv(PINO_PH_ANALOGICO, ADC_NUMERO_AMOSTRAS);
+  return sensorPh.readPH(leituraPhTensaoMv, temperaturaCompensacao);
+}
+
+float lerTdsValorPpm(float temperaturaC) {
+  const float temperaturaCompensacao = isfinite(temperaturaC) ? temperaturaC : TEMPERATURA_PADRAO_C;
+
+  leituraTdsTensaoMv = calcularMediaAdcMv(PINO_TDS_ANALOGICO, ADC_NUMERO_AMOSTRAS);
+
+  float somaTdsPpm = 0.0f;
+  for (uint8_t indiceAmostra = 0; indiceAmostra < ADC_NUMERO_AMOSTRAS; indiceAmostra++) {
+    sensorTds.setTemperature(temperaturaCompensacao);
+    sensorTds.update();
+    somaTdsPpm += sensorTds.getTdsValue();
+    delay(20);
+  }
+
+  leituraTdsValorBrutoPpm = somaTdsPpm / static_cast<float>(ADC_NUMERO_AMOSTRAS);
+  leituraTdsEcUsCm = sensorTds.getEcValue();
+
+  if (!isfinite(leituraTdsValorBrutoPpm)) {
+    return leituraTdsValorBrutoPpm;
+  }
+  if (leituraTdsValorBrutoPpm <= configuracaoSistema.sensorTdsLimiteArPpm) {
+    return 0.0f;
+  }
+  return leituraTdsValorBrutoPpm;
+}
+
+float lerTurbidezTensaoMv() {
+  const float mediaAdc = calcularMediaAdcContagens(PINO_TURBIDEZ_ANALOGICO, ADC_NUMERO_AMOSTRAS);
+
+  leituraTurbidezAdc = static_cast<int>(mediaAdc + 0.5f);
+  if (leituraTurbidezAdc < leituraTurbidezAdcMin) {
+    leituraTurbidezAdcMin = leituraTurbidezAdc;
+  }
+  if (leituraTurbidezAdc > leituraTurbidezAdcMax) {
+    leituraTurbidezAdcMax = leituraTurbidezAdc;
+  }
+
+  return (mediaAdc / ADC_VALOR_MAXIMO) * ADC_REFERENCIA_MV;
+}
+
+float lerDht22HumidadePercent() {
+  if (!SENSOR_DHT22_ATIVO) {
+    return NAN;
+  }
+
+  const uint32_t momentoAtualMs = millis();
+  if ((dht22UltimaLeituraMs != 0) &&
+      (momentoAtualMs - dht22UltimaLeituraMs < DHT22_INTERVALO_LEITURA_MS) &&
+      isfinite(leituraDht22HumidadePercent)) {
+    return leituraDht22HumidadePercent;
+  }
+
+  dht22UltimaLeituraMs = momentoAtualMs;
+  const float humidadeLida = sensorDht22.readHumidity();
+  if (isnan(humidadeLida)) {
+    return NAN;
+  }
+  return constrain(humidadeLida, 0.0f, 100.0f);
+}
+
+float lerCo2Ppm() {
+  if (!SENSOR_CO2_ATIVO) {
+    return NAN;
+  }
+
+  const float tensaoCo2Mv = calcularMediaAdcMv(PINO_CO2_ANALOGICO, ADC_NUMERO_AMOSTRAS);
+  return constrain((tensaoCo2Mv / ADC_REFERENCIA_MV) * 5000.0f, 0.0f, 5000.0f);
+}
+
+// ============================================================================
+// Leitura dos sensores Grove de nivel de agua
+// ============================================================================
+
+bool lerGroveNivelFrame(TwoWire& barramentoI2c, uint8_t enderecoBaixo, uint8_t enderecoAlto, uint8_t* bufferBaixo, uint8_t* bufferAlto) {
+  const int bytesBaixos = barramentoI2c.requestFrom(static_cast<int>(enderecoBaixo), 8);
+  if (bytesBaixos != 8) {
+    return false;
+  }
+  for (int indice = 0; indice < 8; indice++) {
+    bufferBaixo[indice] = barramentoI2c.read();
+  }
+
+  const int bytesAltos = barramentoI2c.requestFrom(static_cast<int>(enderecoAlto), 12);
+  if (bytesAltos != 12) {
+    return false;
+  }
+  for (int indice = 0; indice < 12; indice++) {
+    bufferAlto[indice] = barramentoI2c.read();
+  }
+  return true;
+}
+
+int converterGroveNivelSecoes(const uint8_t* bufferBaixo, const uint8_t* bufferAlto) {
+  constexpr int limiarToque = 100;
+  uint32_t mascaraToque = 0;
+
+  for (int indice = 0; indice < 8; indice++) {
+    if (bufferBaixo[indice] > limiarToque) {
+      mascaraToque |= static_cast<uint32_t>(1) << indice;
+    }
+  }
+
+  for (int indice = 0; indice < 12; indice++) {
+    if (bufferAlto[indice] > limiarToque) {
+      mascaraToque |= static_cast<uint32_t>(1) << (8 + indice);
+    }
+  }
+
+  int secoesAtivas = 0;
+  while (mascaraToque & 0x01u) {
+    secoesAtivas++;
+    mascaraToque >>= 1;
+  }
+  return secoesAtivas;
+}
+
+float lerTanquePrincipalNivelCm(TwoWire& barramentoI2c) {
+  uint8_t bufferBaixo[8] = {0};
+  uint8_t bufferAlto[12] = {0};
+
+  bool leituraOk = lerGroveNivelFrame(
+      barramentoI2c,
+      GROVE_NIVEL_ENDERECO_BAIXO_PRIMARIO,
+      GROVE_NIVEL_ENDERECO_ALTO_PRIMARIO,
+      bufferBaixo,
+      bufferAlto);
+
+  if (!leituraOk) {
+    leituraOk = lerGroveNivelFrame(
+        barramentoI2c,
+        GROVE_NIVEL_ENDERECO_BAIXO_ALTERNATIVO,
+        GROVE_NIVEL_ENDERECO_ALTO_ALTERNATIVO,
+        bufferBaixo,
+        bufferAlto);
+  }
+
+  if (!leituraOk) {
+    return NAN;
+  }
+
+  const int secoesAtivas = converterGroveNivelSecoes(bufferBaixo, bufferAlto);
+  return constrain(static_cast<float>(secoesAtivas) * 0.5f, 0.0f, GROVE_NIVEL_FAIXA_SENSOR_CM);
+}
+
+float converterTanqueNivelParaPercent(float nivelCm, float alturaTanqueCm) {
+  if (!isfinite(nivelCm) || alturaTanqueCm <= 0.0f) {
+    return NAN;
+  }
+  return constrain((nivelCm / alturaTanqueCm) * 100.0f, 0.0f, 100.0f);
+}
+
+EstadoTanqueReposicao lerReposicaoEstado() {
+  const bool sensorAtivo = SENSOR_REPOSICAO_ATIVO_EM_BAIXO
+                               ? (digitalRead(PINO_REPOSICAO_SENSOR_LIMITE) == LOW)
+                               : (digitalRead(PINO_REPOSICAO_SENSOR_LIMITE) == HIGH);
+  return sensorAtivo ? EstadoTanqueReposicao::OK : EstadoTanqueReposicao::Baixo;
+}
+
+// ============================================================================
+// Funcoes auxiliares de estado
+// ============================================================================
+
+const char* textoEstadoReposicao(EstadoTanqueReposicao estadoReposicao) {
+  return (estadoReposicao == EstadoTanqueReposicao::OK) ? "OK" : "LOW";
+}
+
+const char* textoEstadoFaixa(float valorAtual, float minimoAceitavel, float maximoAceitavel) {
+  if (!isfinite(valorAtual)) {
+    return "ERR";
+  }
+  if (valorAtual < minimoAceitavel) {
+    return "LOW";
+  }
+  if (valorAtual > maximoAceitavel) {
+    return "HIGH";
+  }
+  return "OK";
+}
+
+const char* textoEstadoTurbidez(float tensaoMv) {
+  if (!isfinite(tensaoMv)) {
+    return "ERR";
+  }
+  if (tensaoMv >= TURBIDEZ_TENSAO_LIMPA_MV) {
+    return "CLEAR";
+  }
+  if (tensaoMv <= TURBIDEZ_TENSAO_SUJA_MV) {
+    return "DIRTY";
+  }
+  return "MID";
+}
+
+const char* textoEstadoDht22Humidade(float humidadePercent) {
+  if (!isfinite(humidadePercent)) {
+    return "NA";
+  }
+  if (humidadePercent < DHT22_HUMIDADE_MIN_PERCENT) {
+    return "LOW";
+  }
+  if (humidadePercent > DHT22_HUMIDADE_MAX_PERCENT) {
+    return "HIGH";
+  }
+  return "OK";
+}
+
+const char* textoEstadoCo2(float co2Ppm) {
+  if (!isfinite(co2Ppm)) {
+    return "NA";
+  }
+  if (co2Ppm > CO2_LIMITE_ALTO_PPM) {
+    return "HIGH";
+  }
+  return "OK";
+}
+
+bool estadoExigeAviso(const char* textoEstado) {
+  return strcmp(textoEstado, "OK") != 0 && strcmp(textoEstado, "CLEAR") != 0;
+}
+
+// ============================================================================
+// Controlo das bombas de nutrientes
+// ============================================================================
+
+void atualizarBombaSaida(CanalBombaNutriente& canalBomba, bool ligarBomba) {
+  digitalWrite(canalBomba.bombaPino, ligarBomba ? BOMBA_NIVEL_LIGADA : BOMBA_NIVEL_DESLIGADA);
+  canalBomba.bombaLigada = ligarBomba;
+  if (!ligarBomba) {
+    canalBomba.bombaMomentoDesligarMs = 0;
+  }
+}
+
+void desligarTodasBombasNutrientes() {
+  for (auto& canalBomba : canaisBombasNutrientes) {
+    atualizarBombaSaida(canalBomba, false);
+  }
+}
+
+bool existeBombaNutrienteLigada() {
+  for (const auto& canalBomba : canaisBombasNutrientes) {
+    if (canalBomba.bombaLigada) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void iniciarBombaPorTempoMs(CanalBombaNutriente& canalBomba, uint32_t tempoLigadaMs, uint32_t momentoAtualMs) {
+  if (tempoLigadaMs == 0) {
+    return;
+  }
+  atualizarBombaSaida(canalBomba, true);
+  canalBomba.bombaMomentoDesligarMs = momentoAtualMs + tempoLigadaMs;
+}
+
+void iniciarBombaPorVolumeMl(CanalBombaNutriente& canalBomba, float volumeMl, uint32_t momentoAtualMs) {
+  if (volumeMl <= 0.0f || canalBomba.bombaMlPorSegundo <= 0.0f) {
+    return;
+  }
+  const uint32_t tempoLigadaMs = static_cast<uint32_t>((volumeMl / canalBomba.bombaMlPorSegundo) * 1000.0f);
+  iniciarBombaPorTempoMs(canalBomba, tempoLigadaMs, momentoAtualMs);
+}
+
+void atualizarBombasNutrientes(uint32_t momentoAtualMs) {
+  for (auto& canalBomba : canaisBombasNutrientes) {
+    if (!canalBomba.bombaLigada) {
+      continue;
+    }
+    if (static_cast<int32_t>(momentoAtualMs - canalBomba.bombaMomentoDesligarMs) >= 0) {
+      atualizarBombaSaida(canalBomba, false);
+    }
+  }
+}
+
+bool nutrientesEmCooldown(uint32_t momentoAtualMs) {
+  if (nutrientesUltimaDosagemMs == 0) {
+    return false;
+  }
+  return momentoAtualMs - nutrientesUltimaDosagemMs < NUTRIENTES_COOLDOWN_DOSAGEM_MS;
+}
+
+bool nutrientesEmMistura(uint32_t momentoAtualMs) {
+  return momentoAtualMs < nutrientesMisturaAteMs;
+}
+
+bool perfilPermiteDosagem(const PerfilCrescimento& perfilAtivo, uint32_t momentoAtualMs) {
+  if (!isfinite(leituraPhValor) || !isfinite(leituraTdsValorPpm)) {
+    return false;
+  }
+  if (leituraTdsValorPpm <= 0.0f) {
+    return false;
+  }
+  if (leituraPhValor < perfilAtivo.perfilPhMinimo || leituraPhValor > perfilAtivo.perfilPhMaximo) {
+    return false;
+  }
+  if (existeBombaNutrienteLigada()) {
+    return false;
+  }
+  if (nutrientesEmCooldown(momentoAtualMs) || nutrientesEmMistura(momentoAtualMs)) {
+    return false;
+  }
+  return leituraTdsValorPpm < perfilAtivo.perfilTdsAcionamentoPpm;
+}
+
+void iniciarDosagemAutomatica(const PerfilCrescimento& perfilAtivo, uint32_t momentoAtualMs) {
+  const float tdsDeficitPpm = perfilAtivo.perfilTdsAlvoPpm - leituraTdsValorPpm;
+  const float fatorCorrecao = constrain(tdsDeficitPpm / 100.0f, 0.6f, 2.0f);
+
+  iniciarBombaPorVolumeMl(canaisBombasNutrientes[0], perfilAtivo.perfilDoseMicronutrientesMl * fatorCorrecao, momentoAtualMs);
+  iniciarBombaPorVolumeMl(canaisBombasNutrientes[1], perfilAtivo.perfilDoseNitratoCalcioMl * fatorCorrecao, momentoAtualMs);
+  iniciarBombaPorVolumeMl(canaisBombasNutrientes[2], perfilAtivo.perfilDoseNitratoPotassioMl * fatorCorrecao, momentoAtualMs);
+  iniciarBombaPorVolumeMl(canaisBombasNutrientes[3], perfilAtivo.perfilDoseSulfatoMagnesioMl * fatorCorrecao, momentoAtualMs);
+
+  nutrientesUltimaDosagemMs = momentoAtualMs;
+  nutrientesMisturaAteMs = momentoAtualMs + NUTRIENTES_TEMPO_MISTURA_MS;
+}
+
+void atualizarDosagemAutomatica(uint32_t momentoAtualMs) {
+  const PerfilCrescimento& perfilAtivo = obterPerfilCrescimentoAtivo();
+  if (!perfilPermiteDosagem(perfilAtivo, momentoAtualMs)) {
+    return;
+  }
+  iniciarDosagemAutomatica(perfilAtivo, momentoAtualMs);
+}
+
+// ============================================================================
+// Interface OLED
+// ============================================================================
+
+void oledDesenharLinhaMetrica(int16_t posicaoY, const char* legenda, float valor, uint8_t casasDecimais, const char* unidade, const char* estado, bool mostrarPiscar) {
+  displayOled.setCursor(0, posicaoY);
+  displayOled.print(legenda);
+  if (isfinite(valor)) {
+    displayOled.print(valor, casasDecimais);
+  } else {
+    displayOled.print("--");
+  }
+  displayOled.print(unidade);
+
+  if (estadoExigeAviso(estado) && mostrarPiscar) {
+    displayOled.print(" ");
+    displayOled.print(estado);
+  }
+}
+
+void oledDesenharLinhaTexto(int16_t posicaoY, const char* texto, bool textoEmAviso, bool mostrarPiscar) {
+  displayOled.setCursor(0, posicaoY);
+  displayOled.print(texto);
+  if (textoEmAviso && mostrarPiscar) {
+    displayOled.print(" !");
+  }
+}
+
+void atualizarDisplayOled(bool mostrarPiscar) {
+  if (!oledInicializado) {
+    return;
+  }
+
+  const PerfilCrescimento& perfilAtivo = obterPerfilCrescimentoAtivo();
+  const uint8_t paginaAtual = static_cast<uint8_t>((millis() / OLED_INTERVALO_PAGINA_MS) % 3u);
+
+  displayOled.clearDisplay();
+  displayOled.setTextSize(1);
+  displayOled.setTextColor(SSD1306_WHITE);
+
+  if (paginaAtual == 0u) {
+    oledDesenharLinhaMetrica(0, "Temp:", leituraDs18b20TemperaturaC, 1, "C", textoEstadoFaixa(leituraDs18b20TemperaturaC, DS18B20_TEMPERATURA_MIN_C, DS18B20_TEMPERATURA_MAX_C), mostrarPiscar);
+    oledDesenharLinhaMetrica(16, "pH:", leituraPhValor, 2, "", textoEstadoFaixa(leituraPhValor, perfilAtivo.perfilPhMinimo, perfilAtivo.perfilPhMaximo), mostrarPiscar);
+    oledDesenharLinhaMetrica(32, "TDS:", leituraTdsValorPpm, 0, "ppm", textoEstadoFaixa(leituraTdsValorPpm, perfilAtivo.perfilTdsAcionamentoPpm, perfilAtivo.perfilTdsAlvoPpm + 150.0f), mostrarPiscar);
+    oledDesenharLinhaMetrica(48, "EC:", leituraTdsEcUsCm, 0, "uS", textoEstadoFaixa(leituraTdsValorPpm, perfilAtivo.perfilTdsAcionamentoPpm, perfilAtivo.perfilTdsAlvoPpm + 150.0f), mostrarPiscar);
+  } else if (paginaAtual == 1u) {
+    oledDesenharLinhaMetrica(0, "T1:", leituraTanque1Percent, 0, "%", textoEstadoFaixa(leituraTanque1Percent, TANQUE_PRINCIPAL_NIVEL_BAIXO_PERCENT, 100.0f), mostrarPiscar);
+    oledDesenharLinhaMetrica(16, "T2:", leituraTanque2Percent, 0, "%", textoEstadoFaixa(leituraTanque2Percent, TANQUE_PRINCIPAL_NIVEL_BAIXO_PERCENT, 100.0f), mostrarPiscar);
+    char linhaReposicao[24];
+    snprintf(linhaReposicao, sizeof(linhaReposicao), "Repo:%s", textoEstadoReposicao(leituraReposicaoEstado));
+    oledDesenharLinhaTexto(32, linhaReposicao, leituraReposicaoEstado == EstadoTanqueReposicao::Baixo, mostrarPiscar);
+    oledDesenharLinhaMetrica(48, "Turb:", leituraTurbidezTensaoMv, 0, "mV", textoEstadoTurbidez(leituraTurbidezTensaoMv), mostrarPiscar);
+  } else {
+    char linhaPerfil[24];
+    snprintf(linhaPerfil, sizeof(linhaPerfil), "Fase:%s", perfilAtivo.perfilNome);
+    oledDesenharLinhaTexto(0, linhaPerfil, false, mostrarPiscar);
+    oledDesenharLinhaMetrica(16, "Hum:", leituraDht22HumidadePercent, 0, "%", textoEstadoDht22Humidade(leituraDht22HumidadePercent), mostrarPiscar);
+    oledDesenharLinhaMetrica(32, "CO2:", leituraCo2ValorPpm, 0, "ppm", textoEstadoCo2(leituraCo2ValorPpm), mostrarPiscar);
+    char linhaDose[24];
+    snprintf(linhaDose, sizeof(linhaDose), "Dose:%s", existeBombaNutrienteLigada() ? "ON" : "WAIT");
+    oledDesenharLinhaTexto(48, linhaDose, existeBombaNutrienteLigada(), mostrarPiscar);
+  }
+
+  displayOled.display();
+}
+
+// ============================================================================
+// Log serie de alto nivel
+// ============================================================================
+
+void imprimirEstadoSerial() {
+  const PerfilCrescimento& perfilAtivo = obterPerfilCrescimentoAtivo();
+  Serial.printf(
+      "Fase=%s Temp=%.1fC pH=%.2f TDS=%.0fppm bruto=%.0f EC=%.0fuS T1=%.0f%% T2=%.0f%% Repo=%s Turb=%.0fmV adc=%d Hum=%.0f%% CO2=%.0fppm Dose=%s\n",
+      perfilAtivo.perfilNome,
+      leituraDs18b20TemperaturaC,
+      leituraPhValor,
+      leituraTdsValorPpm,
+      leituraTdsValorBrutoPpm,
+      leituraTdsEcUsCm,
+      leituraTanque1Percent,
+      leituraTanque2Percent,
+      textoEstadoReposicao(leituraReposicaoEstado),
+      leituraTurbidezTensaoMv,
+      leituraTurbidezAdc,
+      leituraDht22HumidadePercent,
+      leituraCo2ValorPpm,
+      existeBombaNutrienteLigada() ? "ON" : "WAIT");
+}
+
+}  // namespace
+
 void setup() {
-    Serial.begin(SERIAL_BAUD_RATE);
-    delay(2000); // Wait for serial monitor
-    Serial.println("\n=== Hydroponics System Starting ===");
+  Serial.begin(115200);
+  delay(200);
 
-    pinMode(PIN_ONBOARD_LED, OUTPUT);
+  // Barramento I2C do tanque principal 1 e OLED.
+  Wire.begin(PINO_TANQUE1_SDA, PINO_TANQUE1_SCL);
+  Wire.setClock(100000);
 
-    // Initialize I2C Bus ONCE
-    Wire.begin(PIN_SDA, PIN_SCL);
-    // Wire.setClock(100000); // Optional: Slow down clock if needed
-    
-    // Check specific devices instead of scanning all
-    i2cCheckSpecific();
+  // Segundo barramento I2C dedicado ao tanque principal 2.
+  barramentoI2cTanque2.begin(PINO_TANQUE2_SDA, PINO_TANQUE2_SCL, 100000);
 
-    // Init Modules
-    waterLevel.begin();
-    
-    // Force RTC set to compile time on this upload
-    rtc.begin(true);
-    
-    temp.begin();
-    
-    circulationPump.begin();
-    refillPump.begin();
-    
-    sdLogger.begin();
-    sdLogger.logEvent(rtc, "BOOT");
+  // Configuracao dos canais ADC.
+  analogReadResolution(12);
+  analogSetPinAttenuation(PINO_PH_ANALOGICO, ADC_11db);
+  analogSetPinAttenuation(PINO_TDS_ANALOGICO, ADC_11db);
+  analogSetPinAttenuation(PINO_TURBIDEZ_ANALOGICO, ADC_11db);
+  if (SENSOR_CO2_ATIVO) {
+    analogSetPinAttenuation(PINO_CO2_ANALOGICO, ADC_11db);
+  }
 
-    circulation.begin();
-    
-    Serial.println("=== Initialization Complete ===\n");
+  EEPROM.begin(EEPROM_TAMANHO_BYTES);
+  carregarConfiguracaoSistema();
+
+  sensorDs18b20.begin();
+  sensorDs18b20.setWaitForConversion(false);
+  sensorDs18b20.requestTemperatures();
+  ds18b20UltimoPedidoMs = millis();
+  ds18b20ConversaoPendente = true;
+
+  sensorPh.begin();
+
+  sensorTds.setPin(PINO_TDS_ANALOGICO);
+  sensorTds.setAref(3.3f);
+  sensorTds.setAdcRange(4096.0f);
+  sensorTds.begin();
+
+  if (SENSOR_DHT22_ATIVO) {
+    sensorDht22.begin();
+  }
+
+  pinMode(PINO_REPOSICAO_SENSOR_LIMITE, INPUT_PULLUP);
+
+  for (auto& canalBomba : canaisBombasNutrientes) {
+    pinMode(canalBomba.bombaPino, OUTPUT);
+  }
+  desligarTodasBombasNutrientes();
+
+  oledInicializado = displayOled.begin(SSD1306_SWITCHCAPVCC, OLED_ENDERECO_I2C);
+  if (oledInicializado) {
+    displayOled.clearDisplay();
+    displayOled.setTextSize(1);
+    displayOled.setTextColor(SSD1306_WHITE);
+    displayOled.setCursor(0, 0);
+    displayOled.println("Hydroponics");
+    displayOled.println("Starting...");
+    displayOled.display();
+  }
+
+  Serial.println("[INFO] Sistema hidroponico iniciado.");
 }
 
 void loop() {
-    // 1. Update Sensors
-    waterLevel.update();
-    rtc.update();
-    temp.update();
-    safety.update();
+  const uint32_t sistemaMomentoAtualMs = millis();
 
-    // 2. Run Logic
-    if (!safety.isEmergency()) {
-        if (!safety.isRefillLocked()) refill.update();
-        circulation.update();
+  atualizarBombasNutrientes(sistemaMomentoAtualMs);
+
+  if (ds18b20ConversaoPendente && (sistemaMomentoAtualMs - ds18b20UltimoPedidoMs >= DS18B20_TEMPO_CONVERSAO_MS)) {
+    leituraDs18b20TemperaturaC = lerDs18b20TemperaturaC();
+    ds18b20ConversaoPendente = false;
+  }
+
+  if (sistemaMomentoAtualMs - sistemaUltimoCicloSensoresMs >= SISTEMA_INTERVALO_LEITURA_MS) {
+    sistemaUltimoCicloSensoresMs = sistemaMomentoAtualMs;
+
+    if (!ds18b20ConversaoPendente) {
+      sensorDs18b20.requestTemperatures();
+      ds18b20UltimoPedidoMs = sistemaMomentoAtualMs;
+      ds18b20ConversaoPendente = true;
     }
 
-    // 3. Periodic Logging
-    if (millis() - lastLogTime >= LOG_INTERVAL_MS) {
-        lastLogTime = millis();
-        // Force blink
-        digitalWrite(PIN_ONBOARD_LED, !digitalRead(PIN_ONBOARD_LED));
-        
-        sdLogger.logData(rtc, waterLevel, refillPump, circulationPump, temp);
-    }
+    leituraPhValor = lerPhValor();
+    leituraTdsValorPpm = lerTdsValorPpm(leituraDs18b20TemperaturaC);
+    leituraTurbidezTensaoMv = lerTurbidezTensaoMv();
+    leituraDht22HumidadePercent = lerDht22HumidadePercent();
+    leituraCo2ValorPpm = lerCo2Ppm();
 
-    // 4. Debug Print (Every 3 seconds)
-    if (millis() - lastDebugPrint >= 3000) {
-        lastDebugPrint = millis();
-        
-        // Also blink here to show life
-        digitalWrite(PIN_ONBOARD_LED, !digitalRead(PIN_ONBOARD_LED));
+    leituraTanque1NivelCm = lerTanquePrincipalNivelCm(Wire);
+    leituraTanque2NivelCm = lerTanquePrincipalNivelCm(barramentoI2cTanque2);
+    leituraTanque1Percent = converterTanqueNivelParaPercent(leituraTanque1NivelCm, TANQUE1_ALTURA_TOTAL_CM);
+    leituraTanque2Percent = converterTanqueNivelParaPercent(leituraTanque2NivelCm, TANQUE2_ALTURA_TOTAL_CM);
+    leituraReposicaoEstado = lerReposicaoEstado();
 
-        char ts[24];
-        if (rtc.isValid()) rtc.getTimestamp(ts, sizeof(ts));
-        else strcpy(ts, "--:--:--");
+    atualizarDosagemAutomatica(sistemaMomentoAtualMs);
+    imprimirEstadoSerial();
+  }
 
-        Serial.printf("[STATUS] %s | Level: %d%% (%s) | Temp: %.1fC | Circ: %s | Refill: %s\n",
-            ts,
-            waterLevel.getPercentage(), waterLevel.getStateName(),
-            temp.getCelsius(),
-            circulationPump.isOn() ? "ON" : "OFF",
-            refillPump.isOn() ? "ON" : "OFF"
-        );
-
-        // --- DIAGNOSTICS FOR USER ---
-        if (!rtc.isValid()) {
-            Serial.println("  [!] RTC INVALID. Checking specific addresses...");
-            i2cCheckSpecific();
-            // Try restart with force sync false
-            rtc.begin(false);
-        }
-        if (!temp.isValid()) {
-            Serial.println("  [!] TEMP SENSOR INVALID (Reads -127C). Check 4.7k Resistor & Pin 33.");
-        }
-        // -----------------------------
-    }
+  const bool oledPiscarAviso = ((sistemaMomentoAtualMs / 1000u) % 2u) == 0u;
+  atualizarDisplayOled(oledPiscarAviso);
 }
