@@ -60,9 +60,9 @@ constexpr uint8_t PinoLedEmbutido = 2;
 
 namespace HardwareNiveis {
 
-// Rele tipico de 5V com acionamento em nivel baixo.
-constexpr uint8_t NivelReleAtivo = LOW;
-constexpr uint8_t NivelReleInativo = HIGH;
+// Relays do projeto com acionamento em nivel alto.
+constexpr uint8_t NivelReleAtivo = HIGH;
+constexpr uint8_t NivelReleInativo = LOW;
 
 // LED de diagnostico em nivel alto.
 constexpr uint8_t NivelLedLigado = HIGH;

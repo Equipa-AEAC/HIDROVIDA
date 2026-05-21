@@ -3,18 +3,27 @@
 
 namespace HydroLcdData {
 
-extern char valorTemperatura[16];
-extern char valorPh[16];
-extern char valorTds[16];
-extern char valorTanque1[16];
-extern char valorTanque2[16];
-extern char valorReposicao[16];
-extern char valorTurbidez[16];
-extern char valorFase[16];
-extern char valorHumidade[16];
-extern char valorCo2[16];
-extern char valorDosagem[16];
+extern char lcdValorPh[16];
+extern char lcdValorTds[16];
+extern char lcdValorTdsTensao[16];
+extern char lcdValorTdsEstado[16];
+extern char lcdValorTurbidez[16];
+extern char lcdValorTemperaturaAgua[16];
 
-} // namespace HydroLcdData
+extern char lcdValorTanque1[16];
+extern char lcdValorTanque2[16];
+extern char lcdValorReposicao[16];
 
-#endif // HYDRO_LCD_DATA_H
+extern char lcdValorTemperaturaAmbiente[16];
+extern char lcdValorHumidadeAmbiente[16];
+
+extern char lcdValorSaidaMicro[8];
+extern char lcdValorSaidaCalcio[8];
+extern char lcdValorSaidaPotassio[8];
+extern char lcdValorSaidaMagnesio[8];
+extern char lcdValorSaidaCirculacao[8];
+extern char lcdValorSaidaLuz[8];
+
+}  // namespace HydroLcdData
+
+#endif  // HYDRO_LCD_DATA_H

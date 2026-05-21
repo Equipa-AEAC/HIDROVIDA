@@ -2,16 +2,25 @@
 
 namespace HydroLcdData {
 
-char valorTemperatura[16] = "--";
-char valorPh[16] = "--";
-char valorTds[16] = "--";
-char valorTanque1[16] = "--";
-char valorTanque2[16] = "--";
-char valorReposicao[16] = "--";
-char valorTurbidez[16] = "--";
-char valorFase[16] = "--";
-char valorHumidade[16] = "--";
-char valorCo2[16] = "--";
-char valorDosagem[16] = "--";
+char lcdValorPh[16] = "--";
+char lcdValorTds[16] = "--";
+char lcdValorTdsTensao[16] = "--";
+char lcdValorTdsEstado[16] = "--";
+char lcdValorTurbidez[16] = "--";
+char lcdValorTemperaturaAgua[16] = "--";
 
-} // namespace HydroLcdData
+char lcdValorTanque1[16] = "--";
+char lcdValorTanque2[16] = "--";
+char lcdValorReposicao[16] = "--";
+
+char lcdValorTemperaturaAmbiente[16] = "--";
+char lcdValorHumidadeAmbiente[16] = "--";
+
+char lcdValorSaidaMicro[8] = "OFF";
+char lcdValorSaidaCalcio[8] = "OFF";
+char lcdValorSaidaPotassio[8] = "OFF";
+char lcdValorSaidaMagnesio[8] = "OFF";
+char lcdValorSaidaCirculacao[8] = "OFF";
+char lcdValorSaidaLuz[8] = "OFF";
+
+}  // namespace HydroLcdData
