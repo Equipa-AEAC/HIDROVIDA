@@ -79,12 +79,38 @@ struct SaidaDigital {
   bool saidaLigada;
 };
 
+struct RelogioSoftware {
+  uint8_t relogioHora;
+  uint8_t relogioMinuto;
+  uint8_t relogioSegundo;
+  uint32_t relogioUltimoTickMs;
+};
+
 enum IndiceBombaNutriente : uint8_t {
   BombaMicro = 0,
   BombaCalcio = 1,
   BombaPotassio = 2,
   BombaMagnesio = 3,
   BombaNutrienteTotal = 4,
+};
+
+constexpr uint16_t AUTODOSE_TRIGGER_PPM = 350;
+constexpr uint16_t AUTODOSE_TARGET_PPM = 425;
+constexpr uint16_t AUTODOSE_LIMITE_ALTO_PPM = 550;
+constexpr uint32_t AUTODOSE_MISTURA_MS = 90000;
+constexpr uint32_t AUTODOSE_BLOQUEIO_MS = 300000;
+constexpr uint8_t AUTODOSE_MAX_CICLOS = 3;
+constexpr uint32_t AUTODOSE_PULSO_BOMBAS_MS[BombaNutrienteTotal] = {1200, 1500, 1200, 1000};
+
+enum class EstadoAutoDose : uint8_t {
+  Desligado = 0,
+  Pronto,
+  Doseando,
+  Mistura,
+  TdsInvalido,
+  Manual,
+  Bloqueado,
+  TdsAlto
 };
 
 TwoWire barramentoI2cTanque2 = TwoWire(1);
@@ -114,6 +140,10 @@ SaidaDigital saidaReleLuz = {
     HardwareNiveis::NivelReleInativo,
     false};
 
+HydroHorarioSimples horarioSistemaLuz = {false, 8, 0, 20, 0};
+HydroHorarioSimples horarioSistemaCirculacao = {false, 9, 0, 9, 15};
+RelogioSoftware relogioSistema = {12, 0, 0, 0};
+
 float leituraDs18b20TemperaturaAguaC = NAN;
 float leituraPhValor = NAN;
 float leituraPhTensaoMv = NAN;
@@ -139,6 +169,91 @@ uint32_t sistemaUltimoCicloSensoresMs = 0;
 uint32_t ds18b20UltimoPedidoMs = 0;
 uint32_t dht22UltimaLeituraMs = 0;
 bool ds18b20ConversaoPendente = false;
+
+bool autodoseAtivo = false;
+EstadoAutoDose autodoseEstado = EstadoAutoDose::Desligado;
+uint8_t autodoseIndiceBombaAtual = 0;
+uint8_t autodoseCiclosExecutados = 0;
+uint32_t autodoseMomentoEstadoMs = 0;
+uint32_t autodoseBloqueadoAteMs = 0;
+uint32_t autodoseBombaDesligarMs[BombaNutrienteTotal] = {0};
+bool autodoseBombaTemporizada[BombaNutrienteTotal] = {false};
+
+void aplicarEstadoSaida(SaidaDigital& saida, bool ligar);
+void definirEstadoBombaNutrienteInterno(uint8_t indiceBomba, bool ligada, bool temporizada);
+
+void inicializarRelogioSistema(void) {
+  const char horaCompilacao[] = __TIME__;
+  relogioSistema.relogioHora = static_cast<uint8_t>(((horaCompilacao[0] - '0') * 10) + (horaCompilacao[1] - '0'));
+  relogioSistema.relogioMinuto = static_cast<uint8_t>(((horaCompilacao[3] - '0') * 10) + (horaCompilacao[4] - '0'));
+  relogioSistema.relogioSegundo = static_cast<uint8_t>(((horaCompilacao[6] - '0') * 10) + (horaCompilacao[7] - '0'));
+  relogioSistema.relogioUltimoTickMs = millis();
+}
+
+void normalizarHorario(HydroHorarioSimples& horario) {
+  horario.horarioHoraInicio %= 24;
+  horario.horarioMinutoInicio %= 60;
+  horario.horarioHoraFim %= 24;
+  horario.horarioMinutoFim %= 60;
+}
+
+void atualizarRelogioSistema(void) {
+  const uint32_t momentoAtualMs = millis();
+  while (momentoAtualMs - relogioSistema.relogioUltimoTickMs >= 1000u) {
+    relogioSistema.relogioUltimoTickMs += 1000u;
+    relogioSistema.relogioSegundo++;
+
+    if (relogioSistema.relogioSegundo >= 60) {
+      relogioSistema.relogioSegundo = 0;
+      relogioSistema.relogioMinuto++;
+    }
+
+    if (relogioSistema.relogioMinuto >= 60) {
+      relogioSistema.relogioMinuto = 0;
+      relogioSistema.relogioHora++;
+    }
+
+    if (relogioSistema.relogioHora >= 24) {
+      relogioSistema.relogioHora = 0;
+    }
+  }
+}
+
+uint16_t converterHoraMinutoParaTotalMinutos(uint8_t hora, uint8_t minuto) {
+  return static_cast<uint16_t>(hora % 24) * 60u + static_cast<uint16_t>(minuto % 60);
+}
+
+bool horarioIncluiMomento(const HydroHorarioSimples& horario, uint8_t horaAtual, uint8_t minutoAtual) {
+  if (!horario.horarioAtivo) {
+    return false;
+  }
+
+  const uint16_t minutoInicio = converterHoraMinutoParaTotalMinutos(horario.horarioHoraInicio, horario.horarioMinutoInicio);
+  const uint16_t minutoFim = converterHoraMinutoParaTotalMinutos(horario.horarioHoraFim, horario.horarioMinutoFim);
+  const uint16_t minutoAtualTotal = converterHoraMinutoParaTotalMinutos(horaAtual, minutoAtual);
+
+  if (minutoInicio == minutoFim) {
+    return true;
+  }
+
+  if (minutoInicio < minutoFim) {
+    return minutoAtualTotal >= minutoInicio && minutoAtualTotal < minutoFim;
+  }
+
+  return minutoAtualTotal >= minutoInicio || minutoAtualTotal < minutoFim;
+}
+
+void aplicarHorarioRele(SaidaDigital& saidaRele, const HydroHorarioSimples& horario) {
+  if (!horario.horarioAtivo) {
+    return;
+  }
+
+  const bool deveLigar = horarioIncluiMomento(horario, relogioSistema.relogioHora, relogioSistema.relogioMinuto);
+  if (saidaRele.saidaLigada != deveLigar) {
+    aplicarEstadoSaida(saidaRele, deveLigar);
+    Serial.printf("[HORARIO] %s -> %s\n", saidaRele.saidaNome, deveLigar ? "ON" : "OFF");
+  }
+}
 
 void copiarTextoSeguro(char* destino, size_t tamanhoDestino, const char* texto) {
   if (destino == nullptr || tamanhoDestino == 0) {
@@ -166,6 +281,183 @@ void configurarSaidaSegura(SaidaDigital& saida) {
 void aplicarEstadoSaida(SaidaDigital& saida, bool ligar) {
   digitalWrite(saida.saidaPino, ligar ? saida.saidaNivelAtivo : saida.saidaNivelInativo);
   saida.saidaLigada = ligar;
+}
+
+void definirEstadoBombaNutrienteInterno(uint8_t indiceBomba, bool ligada, bool temporizada) {
+  if (indiceBomba >= BombaNutrienteTotal) {
+    return;
+  }
+
+  aplicarEstadoSaida(saidasBombasNutrientes[indiceBomba], ligada);
+  autodoseBombaTemporizada[indiceBomba] = temporizada && ligada;
+  autodoseBombaDesligarMs[indiceBomba] = ligada && temporizada ? millis() + AUTODOSE_PULSO_BOMBAS_MS[indiceBomba] : 0;
+}
+
+bool existeAlgumaBombaNutrienteLigada(void) {
+  for (uint8_t indiceBomba = 0; indiceBomba < BombaNutrienteTotal; indiceBomba++) {
+    if (saidasBombasNutrientes[indiceBomba].saidaLigada) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool existeAlgumaBombaAutodoseAtiva(void) {
+  for (uint8_t indiceBomba = 0; indiceBomba < BombaNutrienteTotal; indiceBomba++) {
+    if (autodoseBombaTemporizada[indiceBomba]) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void desligarBombasAutodose(void) {
+  for (uint8_t indiceBomba = 0; indiceBomba < BombaNutrienteTotal; indiceBomba++) {
+    if (autodoseBombaTemporizada[indiceBomba]) {
+      definirEstadoBombaNutrienteInterno(indiceBomba, false, false);
+    }
+  }
+}
+
+void atualizarBombasTemporizadasAutodose(uint32_t momentoAtualMs) {
+  for (uint8_t indiceBomba = 0; indiceBomba < BombaNutrienteTotal; indiceBomba++) {
+    if (!autodoseBombaTemporizada[indiceBomba]) {
+      continue;
+    }
+
+    if (static_cast<int32_t>(momentoAtualMs - autodoseBombaDesligarMs[indiceBomba]) >= 0) {
+      definirEstadoBombaNutrienteInterno(indiceBomba, false, false);
+      Serial.printf("[AUTODOSE] %s -> OFF\n", saidasBombasNutrientes[indiceBomba].saidaNome);
+    }
+  }
+}
+
+const char* textoEstadoAutodose(EstadoAutoDose estado) {
+  switch (estado) {
+    case EstadoAutoDose::Desligado:
+      return "OFF";
+    case EstadoAutoDose::Pronto:
+      return "READY";
+    case EstadoAutoDose::Doseando:
+      return "DOSING";
+    case EstadoAutoDose::Mistura:
+      return "MIX";
+    case EstadoAutoDose::TdsInvalido:
+      return "TDS ERR";
+    case EstadoAutoDose::Manual:
+      return "MANUAL";
+    case EstadoAutoDose::Bloqueado:
+      return "LOCK";
+    case EstadoAutoDose::TdsAlto:
+      return "HIGH";
+    default:
+      return "--";
+  }
+}
+
+void iniciarPassoAutodoseAtual(void) {
+  if (autodoseIndiceBombaAtual >= BombaNutrienteTotal) {
+    return;
+  }
+
+  definirEstadoBombaNutrienteInterno(autodoseIndiceBombaAtual, true, true);
+  Serial.printf("[AUTODOSE] %s -> ON\n", saidasBombasNutrientes[autodoseIndiceBombaAtual].saidaNome);
+  autodoseIndiceBombaAtual++;
+}
+
+void atualizarEstadoAutodose(uint32_t momentoAtualMs) {
+  if (!autodoseAtivo) {
+    desligarBombasAutodose();
+    autodoseEstado = EstadoAutoDose::Desligado;
+    autodoseIndiceBombaAtual = 0;
+    autodoseCiclosExecutados = 0;
+    return;
+  }
+
+  if (!leituraTdsValida || !std::isfinite(leituraTdsValorPpm)) {
+    if (!existeAlgumaBombaAutodoseAtiva()) {
+      autodoseEstado = EstadoAutoDose::TdsInvalido;
+    }
+    return;
+  }
+
+  if (leituraTdsValorPpm >= AUTODOSE_LIMITE_ALTO_PPM) {
+    if (!existeAlgumaBombaAutodoseAtiva()) {
+      autodoseEstado = EstadoAutoDose::TdsAlto;
+      autodoseCiclosExecutados = 0;
+    }
+    return;
+  }
+
+  if (existeAlgumaBombaNutrienteLigada() && !existeAlgumaBombaAutodoseAtiva() && autodoseEstado != EstadoAutoDose::Doseando) {
+    autodoseEstado = EstadoAutoDose::Manual;
+    return;
+  }
+
+  if (autodoseEstado == EstadoAutoDose::Bloqueado) {
+    if (static_cast<int32_t>(momentoAtualMs - autodoseBloqueadoAteMs) < 0) {
+      return;
+    }
+
+    autodoseCiclosExecutados = 0;
+    autodoseEstado = EstadoAutoDose::Pronto;
+  }
+
+  if (autodoseEstado == EstadoAutoDose::Doseando) {
+    if (existeAlgumaBombaAutodoseAtiva()) {
+      return;
+    }
+
+    if (autodoseIndiceBombaAtual < BombaNutrienteTotal) {
+      iniciarPassoAutodoseAtual();
+      return;
+    }
+
+    autodoseEstado = EstadoAutoDose::Mistura;
+    autodoseMomentoEstadoMs = momentoAtualMs;
+    autodoseCiclosExecutados++;
+    return;
+  }
+
+  if (autodoseEstado == EstadoAutoDose::Mistura) {
+    if (momentoAtualMs - autodoseMomentoEstadoMs < AUTODOSE_MISTURA_MS) {
+      return;
+    }
+
+    if (!leituraTdsValida || !std::isfinite(leituraTdsValorPpm)) {
+      autodoseEstado = EstadoAutoDose::TdsInvalido;
+      return;
+    }
+
+    if (leituraTdsValorPpm < AUTODOSE_TRIGGER_PPM) {
+      if (autodoseCiclosExecutados >= AUTODOSE_MAX_CICLOS) {
+        autodoseEstado = EstadoAutoDose::Bloqueado;
+        autodoseBloqueadoAteMs = momentoAtualMs + AUTODOSE_BLOQUEIO_MS;
+        return;
+      }
+
+      autodoseEstado = EstadoAutoDose::Doseando;
+      autodoseIndiceBombaAtual = 0;
+      iniciarPassoAutodoseAtual();
+      return;
+    }
+
+    autodoseEstado = leituraTdsValorPpm >= AUTODOSE_LIMITE_ALTO_PPM ? EstadoAutoDose::TdsAlto : EstadoAutoDose::Pronto;
+    autodoseCiclosExecutados = 0;
+    return;
+  }
+
+  if (leituraTdsValorPpm < AUTODOSE_TRIGGER_PPM) {
+    autodoseEstado = EstadoAutoDose::Doseando;
+    autodoseIndiceBombaAtual = 0;
+    autodoseCiclosExecutados = 0;
+    iniciarPassoAutodoseAtual();
+    return;
+  }
+
+  autodoseEstado = EstadoAutoDose::Pronto;
 }
 
 float lerMediaAdcMv(uint8_t pinoAdc, uint8_t numeroAmostras) {
@@ -466,11 +758,13 @@ void atualizarDadosLcd(void) {
   copiarTextoSeguro(HydroLcdData::lcdValorSaidaMagnesio, sizeof(HydroLcdData::lcdValorSaidaMagnesio), textoSaida(saidasBombasNutrientes[BombaMagnesio].saidaLigada));
   copiarTextoSeguro(HydroLcdData::lcdValorSaidaCirculacao, sizeof(HydroLcdData::lcdValorSaidaCirculacao), textoSaida(saidaReleCirculacao.saidaLigada));
   copiarTextoSeguro(HydroLcdData::lcdValorSaidaLuz, sizeof(HydroLcdData::lcdValorSaidaLuz), textoSaida(saidaReleLuz.saidaLigada));
+  copiarTextoSeguro(HydroLcdData::lcdValorAutoDoseEstado, sizeof(HydroLcdData::lcdValorAutoDoseEstado), textoEstadoAutodose(autodoseEstado));
+  copiarTextoSeguro(HydroLcdData::lcdValorAutoDoseModo, sizeof(HydroLcdData::lcdValorAutoDoseModo), autodoseAtivo ? "ON" : "OFF");
 }
 
 void imprimirEstadoSerial(void) {
   Serial.printf(
-      "pH=%.2f pHmV=%.0f TDS=%.0fppm TDSmV=%.0f TDSestado=%s Turb=%.0fmV(%s) Agua=%.1fC Ar=%.1fC Hum=%.0f%% T1=%.0f%% T2=%.0f%% Repo=%s Micro=%s Cal=%s Pot=%s Mag=%s Circ=%s Luz=%s\n",
+      "pH=%.2f pHmV=%.0f TDS=%.0fppm TDSmV=%.0f TDSestado=%s Turb=%.0fmV(%s) Agua=%.1fC Ar=%.1fC Hum=%.0f%% T1=%.0f%% T2=%.0f%% Repo=%s Micro=%s Cal=%s Pot=%s Mag=%s Circ=%s Luz=%s Auto=%s Estado=%s\n",
       leituraPhValor,
       leituraPhTensaoMv,
       leituraTdsValorPpm,
@@ -489,7 +783,9 @@ void imprimirEstadoSerial(void) {
       textoSaida(saidasBombasNutrientes[BombaPotassio].saidaLigada),
       textoSaida(saidasBombasNutrientes[BombaMagnesio].saidaLigada),
       textoSaida(saidaReleCirculacao.saidaLigada),
-      textoSaida(saidaReleLuz.saidaLigada));
+      textoSaida(saidaReleLuz.saidaLigada),
+      autodoseAtivo ? "ON" : "OFF",
+      textoEstadoAutodose(autodoseEstado));
 }
 
 }  // namespace
@@ -507,7 +803,7 @@ void hydroDefinirEstadoBombaNutriente(uint8_t indiceBomba, bool ligada) {
     return;
   }
 
-  aplicarEstadoSaida(saidasBombasNutrientes[indiceBomba], ligada);
+  definirEstadoBombaNutrienteInterno(indiceBomba, ligada, false);
   Serial.printf("[GPIO] %s -> %s (GPIO %u)\n",
                 saidasBombasNutrientes[indiceBomba].saidaNome,
                 ligada ? "ON" : "OFF",
@@ -541,6 +837,68 @@ void hydroDefinirEstadoReleLuz(bool ligado) {
   atualizarDadosLcd();
 }
 
+bool hydroObterAutoDoseAtivo(void) {
+  return autodoseAtivo;
+}
+
+void hydroDefinirAutoDoseAtivo(bool ativo) {
+  autodoseAtivo = ativo;
+
+  if (!autodoseAtivo) {
+    desligarBombasAutodose();
+    autodoseEstado = EstadoAutoDose::Desligado;
+    autodoseIndiceBombaAtual = 0;
+    autodoseCiclosExecutados = 0;
+  } else if (autodoseEstado == EstadoAutoDose::Desligado) {
+    autodoseEstado = EstadoAutoDose::Pronto;
+  }
+
+  atualizarDadosLcd();
+}
+
+HydroAutoDoseEstado hydroObterAutoDoseEstado(void) {
+  HydroAutoDoseEstado estado = {};
+  estado.autoDoseAtivo = autodoseAtivo;
+  estado.autoDoseTriggerPpm = AUTODOSE_TRIGGER_PPM;
+  estado.autoDoseTargetPpm = AUTODOSE_TARGET_PPM;
+  snprintf(estado.autoDoseEstadoTexto, sizeof(estado.autoDoseEstadoTexto), "%s", textoEstadoAutodose(autodoseEstado));
+  return estado;
+}
+
+void hydroObterHoraAtual(uint8_t& hora, uint8_t& minuto, uint8_t& segundo) {
+  hora = relogioSistema.relogioHora;
+  minuto = relogioSistema.relogioMinuto;
+  segundo = relogioSistema.relogioSegundo;
+}
+
+void hydroDefinirHoraAtual(uint8_t hora, uint8_t minuto, uint8_t segundo) {
+  relogioSistema.relogioHora = hora % 24;
+  relogioSistema.relogioMinuto = minuto % 60;
+  relogioSistema.relogioSegundo = segundo % 60;
+  relogioSistema.relogioUltimoTickMs = millis();
+  atualizarDadosLcd();
+}
+
+HydroHorarioSimples hydroObterHorarioLuz(void) {
+  return horarioSistemaLuz;
+}
+
+void hydroDefinirHorarioLuz(const HydroHorarioSimples& horario) {
+  horarioSistemaLuz = horario;
+  normalizarHorario(horarioSistemaLuz);
+  atualizarDadosLcd();
+}
+
+HydroHorarioSimples hydroObterHorarioCirculacao(void) {
+  return horarioSistemaCirculacao;
+}
+
+void hydroDefinirHorarioCirculacao(const HydroHorarioSimples& horario) {
+  horarioSistemaCirculacao = horario;
+  normalizarHorario(horarioSistemaCirculacao);
+  atualizarDadosLcd();
+}
+
 void setup() {
   configurarSaidaSegura(saidasBombasNutrientes[BombaMicro]);
   configurarSaidaSegura(saidasBombasNutrientes[BombaCalcio]);
@@ -551,6 +909,7 @@ void setup() {
 
   Serial.begin(115200);
   delay(200);
+  inicializarRelogioSistema();
 
   Wire.begin(PINO_TANQUE1_SDA, PINO_TANQUE1_SCL);
   Wire.setClock(100000);
@@ -580,6 +939,11 @@ void setup() {
 
 void loop() {
   const uint32_t momentoAtualMs = millis();
+  atualizarRelogioSistema();
+  aplicarHorarioRele(saidaReleLuz, horarioSistemaLuz);
+  aplicarHorarioRele(saidaReleCirculacao, horarioSistemaCirculacao);
+  atualizarBombasTemporizadasAutodose(momentoAtualMs);
+  atualizarEstadoAutodose(momentoAtualMs);
 
   if (ds18b20ConversaoPendente && (momentoAtualMs - ds18b20UltimoPedidoMs >= DS18B20_TEMPO_CONVERSAO_MS)) {
     leituraDs18b20TemperaturaAguaC = lerDs18b20TemperaturaAguaC();

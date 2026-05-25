@@ -22,5 +22,7 @@ char lcdValorSaidaPotassio[8] = "OFF";
 char lcdValorSaidaMagnesio[8] = "OFF";
 char lcdValorSaidaCirculacao[8] = "OFF";
 char lcdValorSaidaLuz[8] = "OFF";
+char lcdValorAutoDoseEstado[16] = "OFF";
+char lcdValorAutoDoseModo[8] = "OFF";
 
 }  // namespace HydroLcdData

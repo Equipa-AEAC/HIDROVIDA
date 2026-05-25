@@ -23,6 +23,8 @@ extern char lcdValorSaidaPotassio[8];
 extern char lcdValorSaidaMagnesio[8];
 extern char lcdValorSaidaCirculacao[8];
 extern char lcdValorSaidaLuz[8];
+extern char lcdValorAutoDoseEstado[16];
+extern char lcdValorAutoDoseModo[8];
 
 }  // namespace HydroLcdData
 

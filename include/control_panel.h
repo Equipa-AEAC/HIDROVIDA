@@ -19,7 +19,12 @@ private:
     SensoresPagina1,
     SensoresPagina2,
     Niveis,
-    Saidas
+    Saidas,
+    AutoDose,
+    HorarioLuz,
+    HorarioCirculacao,
+    Relogio,
+    EditarHora
   };
 
   enum class ItemMenuPrincipal : uint8_t {
@@ -27,7 +32,25 @@ private:
     Sensores,
     Niveis,
     Saidas,
+    AutoDose,
+    HorarioLuz,
+    HorarioCirculacao,
+    Relogio,
     Total
+  };
+
+  enum class ContextoEdicaoHora : uint8_t {
+    Nenhum = 0,
+    RelogioSistema,
+    HorarioLuzInicio,
+    HorarioLuzFim,
+    HorarioCirculacaoInicio,
+    HorarioCirculacaoFim
+  };
+
+  enum class ItemAutoDose : uint8_t {
+    Ativo = 0,
+    Voltar
   };
 
   struct EstadoBotao {
@@ -40,9 +63,17 @@ private:
 
   LiquidCrystal_I2C* lcd = nullptr;
   ModoPainel modoAtual = ModoPainel::MenuPrincipal;
+  ModoPainel modoRetornoEdicao = ModoPainel::MenuPrincipal;
   ItemMenuPrincipal itemMenuSelecionado = ItemMenuPrincipal::Dashboard;
+  uint8_t itemMenuPrimeiroVisivel = 0;
   uint8_t itemSaidaSelecionado = 0;
   uint8_t itemSaidaPrimeiroVisivel = 0;
+  uint8_t itemHorarioSelecionado = 0;
+  ItemAutoDose itemAutoDoseSelecionado = ItemAutoDose::Ativo;
+  uint8_t campoEdicaoSelecionado = 0;
+  ContextoEdicaoHora contextoEdicaoHora = ContextoEdicaoHora::Nenhum;
+  uint8_t valorEdicaoHora = 0;
+  uint8_t valorEdicaoMinuto = 0;
   EstadoBotao botaoEsquerda = {};
   EstadoBotao botaoDireita = {};
   EstadoBotao botaoSelecionar = {};
@@ -56,11 +87,21 @@ private:
 
   void entrarModo(ModoPainel novoModo);
   void moverMenuPrincipal(int8_t direcao);
-  void executarSelecaoMenuPrincipal(void);
+  void executarMenuPrincipal(void);
 
   void moverListaSaidas(int8_t direcao);
-  void executarSelecaoSaidas(void);
+  void executarListaSaidas(void);
   void ajustarJanelaSaidas(void);
+
+  void moverListaHorario(int8_t direcao);
+  void executarListaHorario(void);
+
+  void moverListaAutoDose(int8_t direcao);
+  void executarListaAutoDose(void);
+
+  void prepararEdicaoHora(ContextoEdicaoHora contexto, ModoPainel modoRetorno, uint8_t hora, uint8_t minuto);
+  void atualizarEdicaoHora(int8_t direcao);
+  void confirmarEdicaoHora(void);
 
   void renderizar(void);
   void renderizarMenuPrincipal(void);
@@ -69,6 +110,10 @@ private:
   void renderizarSensoresPagina2(void);
   void renderizarNiveis(void);
   void renderizarSaidas(void);
+  void renderizarAutoDose(void);
+  void renderizarHorario(const char* titulo, bool ativo, uint8_t horaInicio, uint8_t minutoInicio, uint8_t horaFim, uint8_t minutoFim);
+  void renderizarRelogio(void);
+  void renderizarEdicaoHora(void);
 
   void escreverLinhaFormatada(uint8_t linha, const char* texto);
   void limparCacheLinhas(void);
