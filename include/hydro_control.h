@@ -18,6 +18,20 @@ struct HydroAutoDoseEstado {
   char autoDoseEstadoTexto[16];
 };
 
+struct HydroTelemetria {
+  float telemetriaPh;
+  float telemetriaTdsPpm;
+  float telemetriaTemperaturaAguaC;
+  float telemetriaTemperaturaArC;
+  float telemetriaHumidadePercent;
+  float telemetriaNivelAguaPercent;
+  bool telemetriaTdsValida;
+  bool telemetriaSistemaAtivo;
+  bool telemetriaAutoDoseAtivo;
+  char telemetriaHoraTexto[16];
+  char telemetriaEstadoSistema[24];
+};
+
 bool hydroObterEstadoBombaNutriente(uint8_t indiceBomba);
 void hydroDefinirEstadoBombaNutriente(uint8_t indiceBomba, bool ligada);
 
@@ -39,5 +53,12 @@ void hydroDefinirHorarioCirculacao(const HydroHorarioSimples& horario);
 bool hydroObterAutoDoseAtivo(void);
 void hydroDefinirAutoDoseAtivo(bool ativo);
 HydroAutoDoseEstado hydroObterAutoDoseEstado(void);
+
+bool hydroObterSistemaAtivo(void);
+void hydroDefinirSistemaAtivo(bool ativo);
+
+bool hydroExecutarDoseRemota(void);
+
+void hydroObterTelemetria(HydroTelemetria& telemetria);
 
 #endif  // HYDRO_CONTROL_H

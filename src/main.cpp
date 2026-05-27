@@ -12,10 +12,12 @@
 #include <cmath>
 #include <cstdio>
 
+#include "config.h"
 #include "garden.h"
 #include "hardware/pin_map.h"
 #include "hydro_control.h"
 #include "hydro_lcd_data.h"
+#include "services/blynk_service.h"
 
 namespace {
 
@@ -164,6 +166,7 @@ float leituraTanque2NivelCm = NAN;
 float leituraTanque1Percent = NAN;
 float leituraTanque2Percent = NAN;
 bool leituraReposicaoOk = false;
+bool sistemaAtivo = true;
 
 uint32_t sistemaUltimoCicloSensoresMs = 0;
 uint32_t ds18b20UltimoPedidoMs = 0;
@@ -368,6 +371,14 @@ void iniciarPassoAutodoseAtual(void) {
 }
 
 void atualizarEstadoAutodose(uint32_t momentoAtualMs) {
+  if (!sistemaAtivo) {
+    desligarBombasAutodose();
+    autodoseEstado = EstadoAutoDose::Desligado;
+    autodoseIndiceBombaAtual = 0;
+    autodoseCiclosExecutados = 0;
+    return;
+  }
+
   if (!autodoseAtivo) {
     desligarBombasAutodose();
     autodoseEstado = EstadoAutoDose::Desligado;
@@ -701,6 +712,37 @@ float converterNivelParaPercent(float nivelCm, float alturaTotalCm) {
   return constrain((nivelCm / alturaTotalCm) * 100.0f, 0.0f, 100.0f);
 }
 
+float sanitizarValorFaixa(float valor, float minimo, float maximo) {
+  if (!std::isfinite(valor)) {
+    return NAN;
+  }
+
+  if (valor < minimo || valor > maximo) {
+    return NAN;
+  }
+
+  return valor;
+}
+
+float calcularNivelAguaTelemetriaPercent(void) {
+  const bool tanque1Valido = std::isfinite(leituraTanque1Percent);
+  const bool tanque2Valido = std::isfinite(leituraTanque2Percent);
+
+  if (tanque1Valido && tanque2Valido) {
+    return (leituraTanque1Percent + leituraTanque2Percent) * 0.5f;
+  }
+
+  if (tanque1Valido) {
+    return leituraTanque1Percent;
+  }
+
+  if (tanque2Valido) {
+    return leituraTanque2Percent;
+  }
+
+  return NAN;
+}
+
 bool lerEstadoReposicao(void) {
   const bool sensorAtivo = REPOSICAO_SENSOR_ATIVO_EM_BAIXO
                                ? (digitalRead(PINO_REPOSICAO_SENSOR_LIMITE) == LOW)
@@ -727,6 +769,52 @@ const char* textoTurbidez(float tensaoMv) {
     return "DIRTY";
   }
   return "MID";
+}
+
+const char* textoEstadoSistemaBlynk(void) {
+  if (!sistemaAtivo) {
+    return "DISABLED";
+  }
+
+  if (!leituraReposicaoOk) {
+    return "REFILL LOW";
+  }
+
+  if (!leituraTdsValida) {
+    return "TDS INVALID";
+  }
+
+  if (existeAlgumaBombaAutodoseAtiva()) {
+    return "AUTO DOSING";
+  }
+
+  if (existeAlgumaBombaNutrienteLigada()) {
+    return "MANUAL PUMP";
+  }
+
+  if (autodoseAtivo) {
+    switch (autodoseEstado) {
+      case EstadoAutoDose::Pronto:
+        return "AUTO READY";
+      case EstadoAutoDose::Mistura:
+        return "AUTO MIX";
+      case EstadoAutoDose::Bloqueado:
+        return "AUTO LOCK";
+      case EstadoAutoDose::TdsAlto:
+        return "TDS HIGH";
+      case EstadoAutoDose::TdsInvalido:
+        return "TDS INVALID";
+      case EstadoAutoDose::Manual:
+        return "MANUAL HOLD";
+      case EstadoAutoDose::Doseando:
+        return "AUTO DOSING";
+      case EstadoAutoDose::Desligado:
+      default:
+        return "AUTO OFF";
+    }
+  }
+
+  return "MANUAL READY";
 }
 
 void atualizarDadosLcd(void) {
@@ -865,6 +953,63 @@ HydroAutoDoseEstado hydroObterAutoDoseEstado(void) {
   return estado;
 }
 
+bool hydroObterSistemaAtivo(void) {
+  return sistemaAtivo;
+}
+
+void hydroDefinirSistemaAtivo(bool ativo) {
+  sistemaAtivo = ativo;
+
+  if (!sistemaAtivo) {
+    hydroDefinirEstadoReleCirculacao(false);
+    hydroDefinirEstadoReleLuz(false);
+    for (uint8_t indiceBomba = 0; indiceBomba < BombaNutrienteTotal; indiceBomba++) {
+      definirEstadoBombaNutrienteInterno(indiceBomba, false, false);
+    }
+  }
+
+  atualizarDadosLcd();
+}
+
+bool hydroExecutarDoseRemota(void) {
+  if (!sistemaAtivo || !leituraReposicaoOk || !leituraTdsValida || existeAlgumaBombaNutrienteLigada()) {
+    return false;
+  }
+
+  for (uint8_t indiceBomba = 0; indiceBomba < BombaNutrienteTotal; indiceBomba++) {
+    definirEstadoBombaNutrienteInterno(indiceBomba, true, true);
+    Serial.printf("[REMOTE DOSE] %s -> ON\n", saidasBombasNutrientes[indiceBomba].saidaNome);
+  }
+
+  atualizarDadosLcd();
+  return true;
+}
+
+void hydroObterTelemetria(HydroTelemetria& telemetria) {
+  telemetria.telemetriaPh = sanitizarValorFaixa(leituraPhValor, 0.0f, 14.0f);
+  telemetria.telemetriaTdsPpm =
+      leituraTdsValida ? sanitizarValorFaixa(leituraTdsValorPpm, 0.0f, TDS_PPM_MAXIMO_VALIDO) : NAN;
+  telemetria.telemetriaTemperaturaAguaC = sanitizarValorFaixa(leituraDs18b20TemperaturaAguaC, 0.0f, 60.0f);
+  telemetria.telemetriaTemperaturaArC = sanitizarValorFaixa(leituraDht22TemperaturaAmbienteC, -20.0f, 80.0f);
+  telemetria.telemetriaHumidadePercent = sanitizarValorFaixa(leituraDht22HumidadePercent, 0.0f, 100.0f);
+  telemetria.telemetriaNivelAguaPercent = sanitizarValorFaixa(calcularNivelAguaTelemetriaPercent(), 0.0f, 100.0f);
+  telemetria.telemetriaTdsValida = leituraTdsValida;
+  telemetria.telemetriaSistemaAtivo = sistemaAtivo;
+  telemetria.telemetriaAutoDoseAtivo = autodoseAtivo;
+
+  snprintf(telemetria.telemetriaHoraTexto,
+           sizeof(telemetria.telemetriaHoraTexto),
+           "%02u:%02u:%02u",
+           relogioSistema.relogioHora,
+           relogioSistema.relogioMinuto,
+           relogioSistema.relogioSegundo);
+
+  snprintf(telemetria.telemetriaEstadoSistema,
+           sizeof(telemetria.telemetriaEstadoSistema),
+           "%s",
+           textoEstadoSistemaBlynk());
+}
+
 void hydroObterHoraAtual(uint8_t& hora, uint8_t& minuto, uint8_t& segundo) {
   hora = relogioSistema.relogioHora;
   minuto = relogioSistema.relogioMinuto;
@@ -933,6 +1078,7 @@ void setup() {
 
   atualizarDadosLcd();
   Garden::initialize();
+  initBlynk();
 
   Serial.println("[INFO] Sistema simplificado iniciado.");
 }
@@ -940,8 +1086,20 @@ void setup() {
 void loop() {
   const uint32_t momentoAtualMs = millis();
   atualizarRelogioSistema();
-  aplicarHorarioRele(saidaReleLuz, horarioSistemaLuz);
-  aplicarHorarioRele(saidaReleCirculacao, horarioSistemaCirculacao);
+  handleBlynkCommands();
+
+  if (sistemaAtivo) {
+    aplicarHorarioRele(saidaReleLuz, horarioSistemaLuz);
+    aplicarHorarioRele(saidaReleCirculacao, horarioSistemaCirculacao);
+  } else {
+    if (saidaReleLuz.saidaLigada) {
+      aplicarEstadoSaida(saidaReleLuz, false);
+    }
+    if (saidaReleCirculacao.saidaLigada) {
+      aplicarEstadoSaida(saidaReleCirculacao, false);
+    }
+  }
+
   atualizarBombasTemporizadasAutodose(momentoAtualMs);
   atualizarEstadoAutodose(momentoAtualMs);
 
@@ -974,5 +1132,6 @@ void loop() {
     imprimirEstadoSerial();
   }
 
+  updateBlynkSensors();
   Garden::update();
 }
