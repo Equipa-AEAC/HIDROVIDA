@@ -1,3 +1,7 @@
+[🇬🇧 English](README.md) | [🇵🇹 Português](readmes/README-pt.md) | [🇪🇸 Español](readmes/README-es.md) | [🇫🇷 Français](readmes/README-fr.md) | [🇩🇪 Deutsch](readmes/README-de.md) | [🇵🇱 Polski](readmes/README-pl.md)
+
+---
+
 # 🌱 HIDROVIDA  
 ### Intelligent Hydroponic Automation System for Sustainable Agriculture
 
